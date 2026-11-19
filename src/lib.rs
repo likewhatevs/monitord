@@ -788,6 +788,12 @@ pub async fn stat_collector(
             }
         }
 
+        let boot_uptime = if config.units.boot_grace.is_empty() {
+            None
+        } else {
+            units::read_boot_uptime().await
+        };
+
         let elapsed_runtime = collect_start_time.elapsed();
         let elapsed_runtime_ms = elapsed_runtime.as_millis();
 
@@ -818,7 +824,11 @@ pub async fn stat_collector(
             monitord_stats.networkd = machine_stats.networkd.clone();
             monitord_stats.system_state = machine_stats.system_state;
             monitord_stats.version = machine_stats.version.clone();
-            monitord_stats.units = machine_stats.units.clone();
+            monitord_stats.units = units::host_unit_snapshot(
+                &machine_stats.units,
+                &config.units.boot_grace,
+                boot_uptime,
+            );
             monitord_stats.dbus_stats = machine_stats.dbus_stats.clone();
             monitord_stats.boot_blame = machine_stats.boot_blame.clone();
             monitord_stats.verify_stats = machine_stats.verify_stats.clone();

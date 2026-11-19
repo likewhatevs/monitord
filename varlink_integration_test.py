@@ -474,6 +474,9 @@ def build_ci_configs(conf_text: str) -> tuple[str, str]:
             "fixture = monitord-family@*.service",
             "first = monitord-family@1.service",
             "empty = monitord-no-such-family@*.service",
+            "[units.state_stats.boot_grace]",
+            "bus = dbus-broker.service,0",
+            "filtered = monitord-family@1.service,0",
         ]
     )
 
@@ -2000,6 +2003,36 @@ def assert_machine_failure_isolation(container: str) -> None:
     print("PASS: opposite machine collector failures leave fresh defaults in either iteration order")
 
 
+def assert_boot_grace(container: str, outputs: dict[str, Stats]) -> None:
+    unit = "monitord-family@1.service"
+    nested_conf = "/tmp/monitord-boot-grace-ci.conf"
+    for transport, path in (("varlink", VARLINK_CONF), ("dbus", DBUS_CONF)):
+        stats = outputs[transport]
+        base = "monitord.unit_states.dbus-broker.service"
+        if f"{base}.unhealthy_post_grace" not in stats:
+            raise SystemExit(f"FAIL: {transport} host boot grace flag is absent")
+        if stats[f"{base}.unhealthy_post_grace"] != stats[f"{base}.unhealthy"]:
+            raise SystemExit(f"FAIL: {transport} grace=0 disagrees with raw health")
+        for key in stats:
+            if key.endswith(".unhealthy_post_grace") and key != f"{base}.unhealthy_post_grace":
+                raise SystemExit(f"FAIL: {transport} unexpected boot grace flag: {key}")
+
+        # Flat output omits machine unit states. Track the failed fixture unit
+        # shared by the host and both machines and compare their nested states.
+        conf = replace_once(docker_exec(container, "cat", path), "output_format = json-flat", "output_format = json")
+        conf = replace_once(conf, "[units.state_stats.allowlist]", f"[units.state_stats.allowlist]\n{unit}")
+        write_container_file(container, nested_conf, conf)
+        nested, _ = run_monitord(container, nested_conf)
+        host = nested["units"]["unit_states"][unit]
+        if host.get("unhealthy") is not True or host.get("unhealthy_post_grace") is not True:
+            raise SystemExit(f"FAIL: {transport} host {unit} lacks raw or post-grace failure: {host}")
+        for machine in MACHINE_NAMES:
+            state = nested["machines"][machine]["units"]["unit_states"][unit]
+            if state.get("unhealthy") is not True or "unhealthy_post_grace" in state:
+                raise SystemExit(f"FAIL: {transport} {machine} {unit} expected only raw failure: {state}")
+    print("PASS: boot grace applies only to configured host unit states on both transports")
+
+
 def compare_outputs(dbus_stats: Stats, varlink_stats: Stats) -> None:
     step("Comparing D-Bus and varlink output")
     differences = diff_outputs(dbus_stats, varlink_stats)
@@ -2116,6 +2149,7 @@ def main() -> None:
     assert_machine_varlink_usage({"varlink": varlink_stats, "dbus": dbus_stats})
     assert_verify_enumeration_parity(dbus_log, varlink_log)
     assert_failed_families({"varlink": varlink_stats, "dbus": dbus_stats})
+    assert_boot_grace(args.container, {"varlink": varlink_stats, "dbus": dbus_stats})
     assert_time_in_state({"varlink": varlink_stats, "dbus": dbus_stats})
     assert_cgroup_fixture_values({"varlink": varlink_stats, "dbus": dbus_stats})
     compare_outputs(dbus_stats, varlink_stats)

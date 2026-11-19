@@ -238,6 +238,13 @@ ignore_inactive_oneshot_services = true
 # systemd reloads; cgroup counters are still read every cycle. 0 disables.
 service_details_cache_max_age_secs = 300
 
+# Optional boot grace for selected host unit states; raw unhealthy is unchanged.
+# unhealthy_post_grace is false until uptime exceeds the configured seconds.
+# Labels are lowercased; full unit names in values preserve case.
+# [units.state_stats.boot_grace]
+# ssh = sshd.service,120
+# blue = Database@Blue.service,240
+
 # Optional failed counts by full unit name or a pattern with one * wildcard.
 # The * matches one or more characters; patterns are case-sensitive.
 # Count all failed units, independently of state_stats and its allow/block lists.
@@ -361,6 +368,17 @@ the first successful listing the map is absent. If a host listing fails, the
 daemon retains its previous sample. One-shot runs and each machine sweep start
 fresh. Without families configured, output is unchanged. The flat example
 includes two optional families.
+
+Boot grace adds `unhealthy_post_grace = unhealthy && uptime > seconds` to
+configured host units that appear in `unit_states`. It requires `[units] enabled`
+and `state_stats`, and follows the state allow/block lists. At the exact boundary
+the flag is still false. `/proc/uptime` is read once per sample and includes
+suspend time. If uptime cannot be read, the field is absent. The raw `unhealthy`
+flag is unchanged, including on a failed listing that reuses earlier states;
+the derived flag uses the current uptime. Machines do not receive this field.
+Values must be a full unit name followed by a comma and a non-negative integer
+number of seconds. Without grace configured, output is unchanged. The flat
+example includes a configured grace flag.
 
 When using the provided `monitord.service`, systemd creates `/run/monitord` via
 `RuntimeDirectory=monitord` and assigns ownership to the configured service `User`/`Group`.
@@ -706,6 +724,7 @@ they are not repeated below.
   "unit_states.chronyd.service.load_state": 1,
   "unit_states.chronyd.service.time_in_state_usecs": 2176062087185,
   "unit_states.chronyd.service.unhealthy": 0,
+  "unit_states.chronyd.service.unhealthy_post_grace": 0,
   "units.activating_units": 0,
   "units.active_units": 403,
   "units.automount_units": 1,

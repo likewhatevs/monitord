@@ -862,6 +862,7 @@ mod tests {
   "unit_states.unittest.service.load_state": 1,
   "unit_states.unittest.service.time_in_state_usecs": 69,
   "unit_states.unittest.service.unhealthy": 0,
+  "unit_states.unittest.service.unhealthy_post_grace": 0,
   "units.activating_units": 0,
   "units.active_units": 0,
   "units.automount_units": 0,
@@ -1020,6 +1021,7 @@ mod tests {
                 active_state: units::SystemdUnitActiveState::active,
                 load_state: units::SystemdUnitLoadState::loaded,
                 unhealthy: false,
+                unhealthy_post_grace: Some(false),
                 time_in_state_usecs: Some(69),
             },
         );
@@ -1057,6 +1059,7 @@ mod tests {
                 active_state: units::SystemdUnitActiveState::active,
                 load_state: units::SystemdUnitLoadState::loaded,
                 unhealthy: false,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -1067,6 +1070,40 @@ mod tests {
         boot_blame.insert(String::from("sys-module-fuse.device"), 16.210);
         stats.boot_blame = Some(boot_blame);
         stats
+    }
+
+    #[test]
+    fn test_boot_grace_serialization_and_legacy_states() {
+        let legacy = serde_json::json!({
+            "active_state": 3,
+            "load_state": 0,
+            "unhealthy": true,
+            "time_in_state_usecs": null,
+        });
+        let mut state: units::UnitStates = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(state.unhealthy_post_grace, None);
+        assert_eq!(serde_json::to_value(&state).unwrap(), legacy);
+        state.unhealthy_post_grace = Some(false);
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["unhealthy_post_grace"],
+            false
+        );
+        let mut stats = MonitordStats::default();
+        stats.units.unit_states.insert("test.service".into(), state);
+        assert_eq!(
+            flatten_stats(&stats, "")["unit_states.test.service.unhealthy_post_grace"],
+            0
+        );
+        stats
+            .units
+            .unit_states
+            .get_mut("test.service")
+            .unwrap()
+            .unhealthy_post_grace = Some(true);
+        assert_eq!(
+            flatten_stats(&stats, "")["unit_states.test.service.unhealthy_post_grace"],
+            1
+        );
     }
 
     #[test]
@@ -1119,7 +1156,7 @@ mod tests {
     #[test]
     fn test_flatten_map() {
         let json_flat_map = flatten_stats(&return_monitord_stats(), "");
-        assert_eq!(156, json_flat_map.len());
+        assert_eq!(157, json_flat_map.len());
     }
 
     #[test]

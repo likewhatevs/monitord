@@ -147,6 +147,12 @@ class BuildCiConfigsTest(unittest.TestCase):
         self.assertIn(vit.CGROUP_FIXTURE_SERVICE, services)
         self.assertIn("dbus-broker.service", services)
 
+    def test_boot_grace_configured_for_real_and_filtered_units(self) -> None:
+        for conf in (self.dbus_conf, self.varlink_conf):
+            grace = section_body(conf, "[units.state_stats.boot_grace]")
+            self.assertIn("bus = dbus-broker.service,0", grace)
+            self.assertIn("filtered = monitord-family@1.service,0", grace)
+
     def test_failed_families_enabled_for_both_transports(self) -> None:
         for conf in (self.dbus_conf, self.varlink_conf):
             families = section_body(conf, "[units.failed_families]")
