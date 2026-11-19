@@ -285,6 +285,12 @@ fn flatten_units(
             }
         }
     }
+    for (family, count) in &units_stats.failed_families {
+        flat_stats.push((
+            format!("{base_metric_name}.failed_families.{family}"),
+            (*count).into(),
+        ));
+    }
     flat_stats
 }
 
@@ -860,6 +866,8 @@ mod tests {
   "units.active_units": 0,
   "units.automount_units": 0,
   "units.device_units": 0,
+  "units.failed_families.transient-job": 0,
+  "units.failed_families.worker": 0,
   "units.failed_units": 0,
   "units.inactive_units": 0,
   "units.jobs_queued": 0,
@@ -979,6 +987,8 @@ mod tests {
                 ),
             ])),
         };
+        stats.units.failed_families =
+            BTreeMap::from([("worker".into(), 0), ("transient-job".into(), 0)]);
         stats.units.collection_timings = units::UnitsCollectionTimings {
             list_units_ms: 5.0,
             unit_files_ms: 2.0,
@@ -1060,9 +1070,56 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_families_are_optional_and_serialize_for_machines() {
+        let mut stats = MonitordStats::default();
+        for output in [
+            serde_json::to_string(&stats).unwrap(),
+            serde_json::to_string_pretty(&stats).unwrap(),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert!(value["units"].get("failed_families").is_none());
+            let parsed: MonitordStats = serde_json::from_str(&output).unwrap();
+            assert!(parsed.units.failed_families.is_empty());
+        }
+        stats.units.failed_families = BTreeMap::from([("worker".into(), 2), ("empty".into(), 0)]);
+        stats.machines.insert(
+            "box".into(),
+            MachineStats {
+                units: units::SystemdUnitStats {
+                    failed_families: BTreeMap::from([("worker".into(), 1), ("empty".into(), 0)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        for output in [
+            serde_json::to_string(&stats).unwrap(),
+            serde_json::to_string_pretty(&stats).unwrap(),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(
+                value["units"]["failed_families"],
+                serde_json::json!({"worker": 2, "empty": 0})
+            );
+            assert_eq!(
+                value["machines"]["box"]["units"]["failed_families"],
+                serde_json::json!({"worker": 1, "empty": 0})
+            );
+        }
+        let flat = flatten_stats(&stats, "prefix");
+        for (prefix, count) in [("prefix", 2), ("prefix.machines.box", 1)] {
+            assert_eq!(
+                flat[&format!("{prefix}.units.failed_families.worker")],
+                count
+            );
+            assert_eq!(flat[&format!("{prefix}.units.failed_families.empty")], 0);
+        }
+    }
+
+    #[test]
     fn test_flatten_map() {
         let json_flat_map = flatten_stats(&return_monitord_stats(), "");
-        assert_eq!(154, json_flat_map.len());
+        assert_eq!(156, json_flat_map.len());
     }
 
     #[test]
@@ -1125,6 +1182,7 @@ mod tests {
     fn test_unit_counters_covers_all_scalar_fields() {
         // Fields of SystemdUnitStats that are nested maps, not scalar counters.
         const NON_COUNTER_FIELDS: &[&str] = &[
+            "failed_families",
             "unit_files",
             "service_stats",
             "timer_stats",

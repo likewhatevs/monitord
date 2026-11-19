@@ -147,6 +147,13 @@ class BuildCiConfigsTest(unittest.TestCase):
         self.assertIn(vit.CGROUP_FIXTURE_SERVICE, services)
         self.assertIn("dbus-broker.service", services)
 
+    def test_failed_families_enabled_for_both_transports(self) -> None:
+        for conf in (self.dbus_conf, self.varlink_conf):
+            families = section_body(conf, "[units.failed_families]")
+            self.assertIn("fixture = monitord-family@*.service", families)
+            self.assertIn("first = monitord-family@1.service", families)
+            self.assertIn("empty = monitord-no-such-family@*.service", families)
+
     def test_timers_allowlist_emptied(self) -> None:
         self.assertNotIn("fstrim.timer", self.dbus_conf)
 

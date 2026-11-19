@@ -715,6 +715,16 @@ pub async fn parse_metrics(
     stats.collection_timings.list_units_ms = bulk_fetch_elapsed.as_secs_f64() * 1000.0;
 
     let parse_loop_start = Instant::now();
+    stats.failed_families = crate::units::count_failed_families(
+        &config.failed_families,
+        metrics
+            .iter()
+            .filter(|metric| {
+                metric.name_suffix() == "UnitActiveState"
+                    && metric.value().as_str() == Some("failed")
+            })
+            .filter_map(|metric| metric.object()),
+    );
     let has_load_state_totals = metrics
         .iter()
         .any(|metric| metric.name_suffix() == "UnitsByLoadStateTotal");
@@ -1191,8 +1201,72 @@ pub async fn update_unit_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::collections::HashSet;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_failed_families_ignore_state_filters_reset_and_retain_on_failure() {
+        let mut config = crate::config::Config::default();
+        config.units.failed_families = BTreeMap::from([
+            ("worker".into(), "worker@*.service".into()),
+            ("one".into(), "worker@one.service".into()),
+            ("empty".into(), "absent.service".into()),
+        ]);
+        config.units.state_stats = false;
+        config
+            .units
+            .state_stats_blocklist
+            .insert("worker@one.service".into());
+        let config = Arc::new(config);
+        let stats = Arc::new(RwLock::new(MachineStats::default()));
+        let listing = |names: Vec<&str>| {
+            let metrics = names
+                .into_iter()
+                .map(|name| ListOutput {
+                    name: "io.systemd.Manager.UnitActiveState".into(),
+                    value: serde_json::json!("failed"),
+                    object: Some(name.into()),
+                    fields: None,
+                })
+                .collect();
+            futures_util::future::ready(Ok(Arc::new(metrics)))
+                .boxed()
+                .shared()
+        };
+        update_unit_stats(
+            config.clone(),
+            stats.clone(),
+            listing(vec![
+                "worker@one.service",
+                "worker@one.service",
+                "worker@two.service",
+            ]),
+        )
+        .await
+        .unwrap();
+        let before = stats.read().await.units.clone();
+        assert_eq!(
+            before.failed_families,
+            BTreeMap::from([("worker".into(), 2), ("one".into(), 1), ("empty".into(), 0)])
+        );
+        assert!(before.unit_states.is_empty());
+        let failed =
+            futures_util::future::ready(Err(Arc::new(anyhow::anyhow!("listing unavailable"))))
+                .boxed()
+                .shared();
+        assert!(update_unit_stats(config.clone(), stats.clone(), failed)
+            .await
+            .is_err());
+        assert_eq!(stats.read().await.units, before);
+        update_unit_stats(config, stats.clone(), listing(vec![]))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.read().await.units.failed_families,
+            BTreeMap::from([("worker".into(), 0), ("one".into(), 0), ("empty".into(), 0)])
+        );
+    }
 
     #[tokio::test]
     async fn test_shared_metrics_streams_once_for_every_awaiter() {

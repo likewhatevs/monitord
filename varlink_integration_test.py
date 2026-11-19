@@ -468,6 +468,15 @@ def build_ci_configs(conf_text: str) -> tuple[str, str]:
             f"so nothing tracks them (missing: {detail})"
         )
 
+    dbus_lines.extend(
+        [
+            "[units.failed_families]",
+            "fixture = monitord-family@*.service",
+            "first = monitord-family@1.service",
+            "empty = monitord-no-such-family@*.service",
+        ]
+    )
+
     varlink_lines: list[str] = []
     section = ""
     enabled_varlink = False
@@ -1868,6 +1877,47 @@ def diff_outputs(dbus_stats: Stats, varlink_stats: Stats) -> list[str]:
     ]
 
 
+def install_failed_family_fixtures(container: str) -> None:
+    """Install different failed-unit counts on the host and each machine."""
+    for machine, count in ((None, 2), (MACHINE_FIXTURE_NAME, 1), (MACHINE_CURRENT_NAME, 3)):
+        machine_args = [f"--machine={machine}"] if machine else []
+        for index in range(1, count + 1):
+            unit = f"monitord-family@{index}.service"
+            subprocess.run(
+                ["docker", "exec", container, "systemctl", *machine_args, "stop", unit],
+                capture_output=True, check=False,
+            )
+            subprocess.run(
+                [
+                    "docker", "exec", container, "systemd-run", *machine_args,
+                    "--wait", f"--unit={unit}", "/usr/bin/false",
+                ],
+                capture_output=True, check=False, timeout=30,
+            )
+            state = docker_exec(
+                container, "systemctl", *machine_args, "show", unit,
+                "-p", "ActiveState", "--value",
+            ).strip()
+            if state != "failed":
+                raise SystemExit(
+                    f"FAIL: {machine or 'host'} {unit} is {state!r}, expected failed"
+                )
+
+
+def assert_failed_families(outputs: dict[str, Stats]) -> None:
+    for transport, stats in outputs.items():
+        for machine, count in ((None, 2), (MACHINE_FIXTURE_NAME, 1), (MACHINE_CURRENT_NAME, 3)):
+            prefix = f"monitord.machines.{machine}" if machine else "monitord"
+            expected = {"fixture": count, "first": 1, "empty": 0}
+            for family, value in expected.items():
+                key = f"{prefix}.units.failed_families.{family}"
+                if stats.get(key) != value:
+                    raise SystemExit(
+                        f"FAIL: {transport} {key}={stats.get(key)!r}, expected {value}"
+                    )
+    print("PASS: failed families match for host and both machines over both transports")
+
+
 def check_machine_failure_isolation(stats: Stats, log: str) -> None:
     """Check that each failed collector leaves its own machine's defaults."""
     pinned = f"monitord.machines.{MACHINE_FIXTURE_NAME}"
@@ -2057,6 +2107,7 @@ def main() -> None:
         time.sleep(3)
     else:
         raise SystemExit(f"FAIL: fixture machines {MACHINE_NAMES} never all collected")
+    install_failed_family_fixtures(args.container)
     varlink_stats, varlink_log = run_monitord(args.container, VARLINK_CONF)
     dbus_stats, dbus_log = run_monitord(args.container, DBUS_CONF)
 
@@ -2064,6 +2115,7 @@ def main() -> None:
     assert_varlink_usage({"varlink": varlink_stats, "dbus": dbus_stats})
     assert_machine_varlink_usage({"varlink": varlink_stats, "dbus": dbus_stats})
     assert_verify_enumeration_parity(dbus_log, varlink_log)
+    assert_failed_families({"varlink": varlink_stats, "dbus": dbus_stats})
     assert_time_in_state({"varlink": varlink_stats, "dbus": dbus_stats})
     assert_cgroup_fixture_values({"varlink": varlink_stats, "dbus": dbus_stats})
     compare_outputs(dbus_stats, varlink_stats)
