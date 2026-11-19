@@ -331,6 +331,9 @@ fn spawn_timed<F>(
 /// collectors all succeed over varlink/fs/procfs never touches the bus at
 /// all — the prerequisite for the zero-D-Bus claim in #37.
 ///
+/// The configured address belongs to the cell, so independent collection
+/// streams can use different buses without changing the process environment.
+///
 /// `tokio::sync::OnceCell` serializes initializers behind a semaphore:
 /// concurrent first-users wait for the in-flight attempt and share its
 /// result — there is no race and no spare connection. A failed attempt is
@@ -341,7 +344,20 @@ fn spawn_timed<F>(
 /// exists and hangs (wedged broker) would serialize one blocking connect
 /// per D-Bus collector per cycle, where the old code blocked exactly once
 /// at startup. Worth knowing when pointing at an unfamiliar bus address.
-pub(crate) type DbusCell = Arc<tokio::sync::OnceCell<zbus::Connection>>;
+#[derive(Clone)]
+pub(crate) struct DbusCell {
+    address: Arc<str>,
+    connection: Arc<tokio::sync::OnceCell<zbus::Connection>>,
+}
+
+impl DbusCell {
+    fn new(address: &str, connection: Option<zbus::Connection>) -> Self {
+        Self {
+            address: address.into(),
+            connection: Arc::new(tokio::sync::OnceCell::new_with(connection)),
+        }
+    }
+}
 
 /// Resolve the shared D-Bus connection, connecting on first use.
 ///
@@ -354,15 +370,16 @@ pub(crate) async fn dbus_connection(
     cell: &DbusCell,
     dbus_timeout: u64,
 ) -> Result<zbus::Connection, MonitordError> {
-    cell.get_or_try_init(|| async {
-        zbus::connection::Builder::system()
-            .method_timeout(std::time::Duration::from_secs(dbus_timeout))
-            .build()
-            .await
-    })
-    .await
-    .cloned()
-    .map_err(MonitordError::ZbusError)
+    cell.connection
+        .get_or_try_init(|| async {
+            zbus::connection::Builder::address(cell.address.as_ref())
+                .method_timeout(std::time::Duration::from_secs(dbus_timeout))
+                .build()
+                .await
+        })
+        .await
+        .cloned()
+        .map_err(MonitordError::ZbusError)
 }
 
 /// Main statistic collection function running what's required by configuration in parallel
@@ -389,16 +406,11 @@ pub async fn stat_collector(
     let cached_machine_connections: Arc<tokio::sync::Mutex<machines::MachineConnections>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &config.monitord.dbus_address);
     // Seeded when the library caller passes a connection, otherwise
     // connected lazily by the first collector that needs the bus. Mutable
     // so a failed daemon cycle can swap in a fresh cell (see below) rather
     // than letting the next cycle reuse a bus that may have gone away.
-    let mut dbus_cell: DbusCell = Arc::new(tokio::sync::OnceCell::new());
-    if let Some(conn) = maybe_connection {
-        // Seeding cannot fail: a fresh cell is always empty.
-        let _ = dbus_cell.set(conn);
-    }
+    let mut dbus_cell = DbusCell::new(&config.monitord.dbus_address, maybe_connection);
     let dbus_timeout = config.monitord.dbus_timeout;
     let mut join_set: tokio::task::JoinSet<TimedCollectorOutput> = tokio::task::JoinSet::new();
     let mut had_error;
@@ -449,7 +461,7 @@ pub async fn stat_collector(
 
         // Always collect systemd version
         {
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let stats_clone = locked_machine_stats.clone();
             let describe = manager_describe.clone();
             let no_fallback = config.varlink.no_fallback;
@@ -491,7 +503,7 @@ pub async fn stat_collector(
         // Run networkd collector if enabled
         if config.networkd.enabled {
             let config_clone = Arc::clone(&config);
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let stats_clone = locked_machine_stats.clone();
             let no_fallback = config.varlink.no_fallback;
             spawn_timed(&mut join_set, "networkd", collect_start_time, async move {
@@ -532,7 +544,7 @@ pub async fn stat_collector(
 
         // Run system running (SystemState) state collector
         if config.system_state.enabled {
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let stats_clone = locked_machine_stats.clone();
             let describe = manager_describe.clone();
             let no_fallback = config.varlink.no_fallback;
@@ -574,7 +586,7 @@ pub async fn stat_collector(
         // Run service collectors if there are services listed in config
         if config.units.enabled {
             let config_clone = Arc::clone(&config);
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let stats_clone = locked_machine_stats.clone();
             let metrics = manager_metrics.clone();
             let no_fallback = config.varlink.no_fallback;
@@ -649,7 +661,7 @@ pub async fn stat_collector(
         if config.machines.enabled {
             let stats_clone = locked_machine_stats.clone();
             let config_clone = Arc::clone(&config);
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let monitord_stats_clone = locked_monitord_stats.clone();
             let connections_clone = cached_machine_connections.clone();
             spawn_timed(&mut join_set, "machines", collect_start_time, async move {
@@ -668,7 +680,7 @@ pub async fn stat_collector(
         }
 
         if config.dbus_stats.enabled {
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let config_clone = Arc::clone(&config);
             let stats_clone = locked_machine_stats.clone();
             spawn_timed(
@@ -686,7 +698,7 @@ pub async fn stat_collector(
         // they take the shared cell and resolve it only on a D-Bus code
         // path, so a varlink success or cache hit never connects.
         if config.boot_blame.enabled {
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let config_clone = Arc::clone(&config);
             let stats_clone = locked_machine_stats.clone();
             spawn_timed(
@@ -708,7 +720,7 @@ pub async fn stat_collector(
         }
 
         if config.verify.enabled {
-            let dbus_cell = Arc::clone(&dbus_cell);
+            let dbus_cell = dbus_cell.clone();
             let config_clone = Arc::clone(&config);
             let stats_clone = locked_machine_stats.clone();
             let metrics = config
@@ -840,7 +852,7 @@ pub async fn stat_collector(
             // Each iteration clones the cell into its tasks at spawn time,
             // so reassigning the local is enough for the next cycle's
             // spawns to pick up the fresh cell.
-            dbus_cell = Arc::new(tokio::sync::OnceCell::new());
+            dbus_cell = DbusCell::new(&config.monitord.dbus_address, None);
         }
         if elapsed_runtime_ms >= collect_interval_ms {
             warn!(
@@ -865,7 +877,7 @@ pub async fn stat_collector(
     let conn = if had_error {
         None
     } else {
-        dbus_cell.get().cloned()
+        dbus_cell.connection.get().cloned()
     };
     Ok(conn)
 }
@@ -879,18 +891,16 @@ mod tests {
     /// report) a fresh error rather than inheriting a poisoned cell.
     #[tokio::test]
     async fn test_dbus_connection_failure_is_not_cached() {
-        std::env::set_var(
-            "DBUS_SYSTEM_BUS_ADDRESS",
-            "unix:path=/nonexistent/monitord-test-bus-socket",
-        );
-        let cell: DbusCell = Arc::new(tokio::sync::OnceCell::new());
+        let dir = tempfile::tempdir().unwrap();
+        let address = format!("unix:path={}/missing-bus", dir.path().display());
+        let cell = DbusCell::new(&address, None);
         assert!(dbus_connection(&cell, 1).await.is_err());
         assert!(
-            cell.get().is_none(),
+            cell.connection.get().is_none(),
             "failed connect must not populate the cell"
         );
         assert!(dbus_connection(&cell, 1).await.is_err());
-        assert!(cell.get().is_none());
+        assert!(cell.connection.get().is_none());
     }
 
     #[test]

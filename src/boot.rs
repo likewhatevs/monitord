@@ -272,7 +272,7 @@ async fn collect_boot_blame_dbus(
 /// Takes the shared D-Bus cell rather than a connection: cache hits and the
 /// varlink path return without ever connecting, so a bus-less host only
 /// pays for D-Bus when it actually collects over D-Bus.
-pub async fn update_boot_blame_stats(
+pub(crate) async fn update_boot_blame_stats(
     config: Arc<Config>,
     dbus: crate::DbusCell,
     dbus_timeout: u64,
