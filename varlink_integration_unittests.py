@@ -51,6 +51,76 @@ def section_body(conf: str, header: str) -> str:
     return body.split("\n[", 1)[0]
 
 
+class MachineFailureIsolationTest(unittest.TestCase):
+    def sample(self) -> vit.Stats:
+        return {
+            f"monitord.machines.{vit.MACHINE_FIXTURE_NAME}.system-state": 4,
+            f"monitord.machines.{vit.MACHINE_FIXTURE_NAME}.varlink_usage.system_state": 1,
+            f"monitord.machines.{vit.MACHINE_FIXTURE_NAME}.units.total_units": 0,
+            f"monitord.machines.{vit.MACHINE_CURRENT_NAME}.system-state": 0,
+            f"monitord.machines.{vit.MACHINE_CURRENT_NAME}.units.total_units": 100,
+        }
+
+    def log(self) -> str:
+        return "\n".join(
+            f"Collection specific failure (container {machine}): "
+            f"varlink container {machine} {collector} failed and "
+            "[varlink] no_fallback=true forbids the D-Bus fallback: fixture failure"
+            for machine, collector in (
+                (vit.MACHINE_FIXTURE_NAME, "units"),
+                (vit.MACHINE_CURRENT_NAME, "system state"),
+                (vit.MACHINE_CURRENT_NAME, "units"),
+            )
+        )
+
+    def test_distinct_collector_successes_pass(self) -> None:
+        vit.check_machine_failure_isolation(self.sample(), self.log())
+
+    def test_pinned_first_system_state_leak_fails(self) -> None:
+        stats = self.sample()
+        stats[f"monitord.machines.{vit.MACHINE_CURRENT_NAME}.system-state"] = 4
+        with self.assertRaisesRegex(SystemExit, "system state inherited"):
+            vit.check_machine_failure_isolation(stats, self.log())
+
+    def test_current_first_units_leak_fails(self) -> None:
+        stats = self.sample()
+        stats[f"monitord.machines.{vit.MACHINE_FIXTURE_NAME}.units.total_units"] = 100
+        with self.assertRaisesRegex(SystemExit, "units inherited"):
+            vit.check_machine_failure_isolation(stats, self.log())
+
+    def test_absent_machines_cannot_pass_vacuously(self) -> None:
+        with self.assertRaises(SystemExit):
+            vit.check_machine_failure_isolation({}, self.log())
+
+    def test_missing_current_machine_cannot_pass(self) -> None:
+        stats = {
+            key: value for key, value in self.sample().items()
+            if not key.startswith(f"monitord.machines.{vit.MACHINE_CURRENT_NAME}.")
+        }
+        with self.assertRaisesRegex(SystemExit, "units listing did not succeed"):
+            vit.check_machine_failure_isolation(stats, self.log())
+
+    def test_uncollected_current_units_cannot_pass(self) -> None:
+        stats = self.sample()
+        stats[f"monitord.machines.{vit.MACHINE_CURRENT_NAME}.units.total_units"] = 0
+        with self.assertRaisesRegex(SystemExit, "units listing did not succeed"):
+            vit.check_machine_failure_isolation(stats, self.log())
+
+    def test_missing_varlink_success_gauge_fails(self) -> None:
+        stats = self.sample()
+        del stats[f"monitord.machines.{vit.MACHINE_FIXTURE_NAME}.varlink_usage.system_state"]
+        with self.assertRaisesRegex(SystemExit, "not collected over varlink"):
+            vit.check_machine_failure_isolation(stats, self.log())
+
+    def test_each_intended_collector_failure_must_be_logged(self) -> None:
+        lines = self.log().splitlines()
+        for omitted in range(len(lines)):
+            with self.subTest(omitted=omitted):
+                log = "\n".join(line for index, line in enumerate(lines) if index != omitted)
+                with self.assertRaisesRegex(SystemExit, "collection failure in log"):
+                    vit.check_machine_failure_isolation(self.sample(), log)
+
+
 class BuildCiConfigsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dbus_conf, self.varlink_conf = vit.build_ci_configs(STOCK_CONF)

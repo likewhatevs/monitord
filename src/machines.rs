@@ -356,14 +356,13 @@ pub async fn update_machines_stats(
     locked_monitord_stats: Arc<RwLock<MonitordStats>>,
     cached_connections: Arc<Mutex<MachineConnections>>,
 ) -> anyhow::Result<()> {
-    let locked_machine_stats: Arc<RwLock<MachineStats>> =
-        Arc::new(RwLock::new(MachineStats::default()));
-
     let current_machines = get_machines(&config, &dbus_cell, &host_stats).await?;
 
     evict_stale_connections(&cached_connections, &current_machines).await;
 
     for (machine, leader_pid) in current_machines.into_iter() {
+        // A failed collector must not inherit the preceding machine's data.
+        let locked_machine_stats = Arc::new(RwLock::new(MachineStats::default()));
         debug!(
             "Collecting container: machine: {} leader_pid: {}",
             machine, leader_pid
