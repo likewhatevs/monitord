@@ -778,6 +778,9 @@ pub async fn stat_collector(
         // parent; the guard must be dropped before the first `.await` below
         // since span guards are not valid to hold across an await point.
         drop(run_guard);
+        // The collectors own their copies. Release completed replies before the daemon sleeps.
+        drop(manager_describe);
+        drop(manager_metrics);
 
         // Drain join_set, collect per-collector timings + log per-collector failures
         had_error = false;
