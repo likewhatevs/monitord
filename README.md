@@ -70,6 +70,10 @@ We offer the following run modes:
   - Enable daemon mode in configuration file
   - Stats will be written to stdout every `daemon_stats_refresh_secs`
 
+The binary starts one Tokio worker per available CPU by default. Set
+`TOKIO_WORKER_THREADS` to a positive integer to tune it, for example
+`TOKIO_WORKER_THREADS=4 monitord` for a short one-shot collection.
+
 Open to more formats / run methods ... Open an issue to discuss. Depends on the dependencies basically.
 
 `monitord` is a config driven binary. We plan to keep CLI arguments to a minimum.

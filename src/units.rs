@@ -16,7 +16,6 @@ use std::time::UNIX_EPOCH;
 use struct_field_names_as_array::FieldNamesAsArray;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::error;
@@ -395,6 +394,16 @@ pub const SERVICE_FIELD_NAMES: &[&str] = &ServiceStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_FIELD_NAMES: &[&str] = &SystemdUnitStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_STATES_FIELD_NAMES: &[&str] = &UnitStates::FIELD_NAMES_AS_ARRAY;
 
+async fn cgroup_or_dbus(
+    value: Option<u64>,
+    property: impl std::future::Future<Output = zbus::Result<u64>>,
+) -> zbus::Result<u64> {
+    match value {
+        Some(value) => Ok(value),
+        None => property.await,
+    }
+}
+
 /// Pull out selected systemd service statistics
 ///
 /// The seven cgroup-derived fields (`cpuusage_nsec`, `ioread_bytes`,
@@ -434,9 +443,9 @@ async fn parse_service(
     // These all share the same D-Bus connection so spawn adds no parallelism benefit.
     let (control_group, main_pid, control_pid) =
         tokio::join!(sp.control_group(), sp.main_pid(), sp.control_pid());
-    let (control_group, main_pid, control_pid) = (control_group?, main_pid?, control_pid?);
+    let control_group = control_group?;
     let mut extra_pids = Vec::with_capacity(2);
-    for pid in [main_pid, control_pid] {
+    for pid in [main_pid?, control_pid?] {
         if pid != 0 {
             extra_pids.push(pid);
         }
@@ -473,12 +482,8 @@ async fn parse_service(
         cgroup_stats,
     );
 
-    // Per-field D-Bus fallback for whatever cgroupfs had no data for: only
-    // missing fields pay for a fallback call, in the same single batch — so
-    // the hot path (cgroup present, the common case for running services)
-    // issues none, and a property that errors only fails its own field via
-    // the `?` below rather than the whole service (matching how a missing
-    // cgroup file behaves).
+    // Poll D-Bus properties only for counters missing from cgroupfs.
+    // Finish the batch before returning the first error in field order.
     let (
         cpuusage_nsec,
         ioread_bytes,
@@ -487,74 +492,28 @@ async fn parse_service(
         memory_available,
         tasks_current,
     ) = tokio::join!(
-        async {
-            match cgroup_stats.cpu_usage_nsec {
-                Some(value) => Ok(value),
-                None => sp.cpu_usage_n_sec().await,
-            }
-        },
-        async {
-            match cgroup_stats.io_read_bytes {
-                Some(value) => Ok(value),
-                None => sp.io_read_bytes().await,
-            }
-        },
-        async {
-            match cgroup_stats.io_read_operations {
-                Some(value) => Ok(value),
-                None => sp.io_read_operations().await,
-            }
-        },
-        async {
-            match cgroup_stats.memory_current {
-                Some(value) => Ok(value),
-                None => sp.memory_current().await,
-            }
-        },
-        async {
-            match cgroup_stats.memory_available {
-                Some(value) => Ok(value),
-                None => sp.memory_available().await,
-            }
-        },
-        async {
-            match cgroup_stats.tasks_current {
-                Some(value) => Ok(value),
-                None => sp.tasks_current().await,
-            }
-        },
+        cgroup_or_dbus(cgroup_stats.cpu_usage_nsec, sp.cpu_usage_n_sec()),
+        cgroup_or_dbus(cgroup_stats.io_read_bytes, sp.io_read_bytes()),
+        cgroup_or_dbus(cgroup_stats.io_read_operations, sp.io_read_operations()),
+        cgroup_or_dbus(cgroup_stats.memory_current, sp.memory_current()),
+        cgroup_or_dbus(cgroup_stats.memory_available, sp.memory_available()),
+        cgroup_or_dbus(cgroup_stats.tasks_current, sp.tasks_current()),
     );
-    let (
-        cpuusage_nsec,
-        ioread_bytes,
-        ioread_operations,
-        memory_current,
-        memory_available,
-        tasks_current,
-    ) = (
-        cpuusage_nsec?,
-        ioread_bytes?,
-        ioread_operations?,
-        memory_current?,
-        memory_available?,
-        tasks_current?,
-    );
-
     Ok(ServiceStats {
+        cpuusage_nsec: cpuusage_nsec?,
+        ioread_bytes: ioread_bytes?,
+        ioread_operations: ioread_operations?,
+        memory_current: memory_current?,
+        memory_available: memory_available?,
+        tasks_current: tasks_current?,
         active_enter_timestamp: active_enter_timestamp?,
         active_exit_timestamp: active_exit_timestamp?,
-        cpuusage_nsec,
         inactive_exit_timestamp: inactive_exit_timestamp?,
-        ioread_bytes,
-        ioread_operations,
-        memory_current,
-        memory_available,
         nrestarts: nrestarts?,
         processes: cgroup_stats.processes,
         restart_usec: restart_usec?,
         state_change_timestamp: state_change_timestamp?,
         status_errno: status_errno?,
-        tasks_current,
         timeout_clean_usec: timeout_clean_usec?,
         watchdog_usec: watchdog_usec?,
     })
@@ -938,38 +897,20 @@ pub async fn parse_unit_state(
         parse_unit(&mut stats, unit);
     }
 
-    // Bounded-concurrency D-Bus work per unit. A semaphore (rather than an
-    // unbounded join) caps how many units are in flight at once: a burst of
-    // simultaneous D-Bus calls could itself worsen host-level IPC contention
-    // on hosts where per-call latency is already elevated, which is exactly
-    // the failure mode this loop exists to avoid.
-    let semaphore = Arc::new(Semaphore::new(
-        config.units.per_unit_concurrency.max(1) as usize
-    ));
-    // Captured once, outside the loop: `JoinSet::spawn` runs each unit on a new
-    // task, and tracing spans do not cross task boundaries automatically. Without
-    // attaching this as the explicit parent below, every `unit_collect` span
-    // becomes its own unrelated root trace instead of a child of this collector.
-    let parent_span = tracing::Span::current();
+    // Keep concurrent D-Bus calls bounded on busy hosts.
+    let limit = config.units.per_unit_concurrency;
     // Host-wide memory numbers for the `memory_available` fold, read once
     // per collection cycle and shared by every unit (rather than once per
     // service inside `parse_service`).
     let host_memory = crate::cgroup::read_host_memory().await;
-    let mut join_set: JoinSet<PerUnitOutcome> = JoinSet::new();
-    for unit in listed_units {
-        let semaphore = Arc::clone(&semaphore);
+    let mut pending = listed_units.into_iter().map(|unit| {
         let config = Arc::clone(config);
-        let connection = connection.clone();
-        let parent_span = parent_span.clone();
+        let manager = p.clone();
         let fs_root = fs_root.to_string();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .expect("semaphore closed unexpectedly");
+        async move {
+            let connection = manager.inner().connection();
             let unit_collect_start = Instant::now();
-            let span =
-                tracing::debug_span!(parent: &parent_span, "unit_collect", unit = %unit.name);
+            let span = tracing::debug_span!("unit_collect", unit = %unit.name);
             let mut outcome = async {
                 let mut outcome = PerUnitOutcome {
                     unit_name: unit.name.clone(),
@@ -981,7 +922,7 @@ pub async fn parse_unit_state(
                 // is logged and skipped rather than aborting the whole
                 // collection cycle for every other unit.
                 if config.units.state_stats {
-                    match parse_state(&unit, &config.units, Some(&connection)).await {
+                    match parse_state(&unit, &config.units, Some(connection)).await {
                         Ok((did_fetch, entry)) => {
                             outcome.state_dbus_fetch = did_fetch;
                             outcome.unit_states_entry = entry;
@@ -996,7 +937,7 @@ pub async fn parse_unit_state(
                 if config.services.contains(&unit.name) {
                     debug!("Collecting service stats for {:?}", &unit);
                     match parse_service(
-                        &connection,
+                        connection,
                         &unit.name,
                         &unit.unit_object_path,
                         &fs_root,
@@ -1019,7 +960,7 @@ pub async fn parse_unit_state(
                     && (config.timers.allowlist.is_empty()
                         || config.timers.allowlist.contains(&unit.name))
                 {
-                    match crate::timer::collect_timer_stats(&connection, &unit).await {
+                    match crate::timer::collect_timer_stats_with_manager(&manager, &unit).await {
                         Ok(ts) => outcome.timer_stats_entry = Some(ts),
                         Err(err) => error!("Failed to get {} stats: {:#?}", &unit.name, err),
                     }
@@ -1032,11 +973,12 @@ pub async fn parse_unit_state(
 
             outcome.duration_ms = unit_collect_start.elapsed().as_secs_f64() * 1000.0;
             outcome
-        });
-    }
-
+        }
+        .in_current_span()
+    });
+    let mut running = JoinSet::new();
     let mut slowest_units: Vec<(String, f64)> = Vec::new();
-    while let Some(res) = join_set.join_next().await {
+    while let Some(res) = crate::join_next_bounded(&mut running, &mut pending, limit).await {
         let outcome = match res {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -1116,6 +1058,13 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use strum::IntoEnumIterator;
+
+    #[tokio::test]
+    async fn test_cgroup_counter_only_polls_dbus_if_missing() {
+        let counter = cgroup_or_dbus(Some(0), async { panic!("unexpected D-Bus call") }).await;
+        assert_eq!(counter.unwrap(), 0);
+        assert_eq!(cgroup_or_dbus(None, async { Ok(17) }).await.unwrap(), 17);
+    }
 
     fn get_unit_file() -> ListedUnit {
         ListedUnit {
