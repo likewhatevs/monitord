@@ -548,7 +548,7 @@ fn flatten_units_collection_timings(
 }
 
 /// Take the standard returned structs and move all to a flat BTreeMap<str, float|int> like JSON
-fn flatten_stats(
+pub(crate) fn flatten_stats(
     stats_struct: &MonitordStats,
     key_prefix: &str,
 ) -> BTreeMap<String, serde_json::Value> {
