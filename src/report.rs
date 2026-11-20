@@ -18,7 +18,6 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{self, FuturesUnordered};
 use futures_util::StreamExt;
+use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -412,45 +412,17 @@ fn validate_listener(fd: std::os::fd::RawFd) -> anyhow::Result<()> {
 
 /// Probe a Unix socket without blocking when its accept queue is full.
 fn probe_socket(path: &Path) -> std::io::Result<()> {
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: socket returned a new descriptor, owned only here.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: an all-zero sockaddr_un is valid before filling its fields.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid Unix socket path",
-        ));
-    }
-    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *byte as libc::c_char;
-    }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    // SAFETY: address is initialized and len includes its NUL-terminated path.
-    let result = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            (&address as *const libc::sockaddr_un).cast(),
-            len as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    let fd = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // Require room for the trailing NUL. rustix also accepts a full-width path.
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid Unix socket path")
+    })?;
+    connect(&fd, &SocketAddrUnix::new(path)?).map_err(Into::into)
 }
 
 /// Bind `path`, replacing a socket file only if nobody is serving on it.
@@ -1207,6 +1179,16 @@ mod tests {
         // The first listener's socket file is still there and still answers.
         std::os::unix::net::UnixStream::connect(dir.path().join(REPORT_SOCKET_NAME))
             .expect("original listener still reachable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_probe_rejects_invalid_socket_paths() {
+        // A Linux pathname socket needs room for the NUL in its 108-byte sun_path.
+        for path in ["x".repeat(108), "x\0y".into()] {
+            let error = probe_socket(Path::new(&path)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
