@@ -180,14 +180,14 @@ pub struct DBusStatsConfig {
     pub peer_allowlist: HashSet<String>,
     #[field_names_as_slice(skip)]
     pub peer_blocklist: HashSet<String>,
-    /// Max number of well-known bus names whose owner lookup runs concurrently
-    /// when resolving peer names. Bounded (rather than unbounded) for the same
-    /// reason as `UnitsConfig::per_unit_concurrency`: a burst of simultaneous
-    /// D-Bus calls can itself worsen host-level IPC contention.
+    /// Maximum concurrent D-Bus calls to resolve peer names or machine peer credentials.
     #[default = 8]
     pub peer_name_concurrency: u64,
 
     pub cgroup_stats: bool,
+    /// Include machine buses when collecting broker peer cgroups.
+    #[default = true]
+    pub machine_cgroup_stats: bool,
     #[field_names_as_slice(skip)]
     pub cgroup_allowlist: HashSet<String>,
     #[field_names_as_slice(skip)]
@@ -519,6 +519,11 @@ impl TryFrom<Ini> for Config {
         }
 
         config.dbus_stats.cgroup_stats = read_config_bool(&ini_config, "dbus", "cgroup_stats")?;
+        if let Some(enabled) =
+            read_config_optional_bool(&ini_config, "dbus", "machine_cgroup_stats")?
+        {
+            config.dbus_stats.machine_cgroup_stats = enabled;
+        }
         config.dbus_stats.cgroup_allowlist = section_keys("dbus.cgroup.allowlist");
         config.dbus_stats.cgroup_blocklist = section_keys("dbus.cgroup.blocklist");
 
@@ -809,6 +814,7 @@ peer_stats = true
 peer_well_known_names_only = true
 peer_name_concurrency = 12
 cgroup_stats = true
+machine_cgroup_stats = false
 
 [dbus.user.allowlist]
 foo
@@ -895,6 +901,7 @@ output_format = json-flat
         assert!(default_config.machines.varlink);
         assert!(default_config.boot_blame.varlink);
         assert!(default_config.verify.varlink);
+        assert!(default_config.dbus_stats.machine_cgroup_stats);
     }
 
     #[test]
@@ -1238,6 +1245,7 @@ varlink = false
                 peer_blocklist: HashSet::from([String::from("foo2")]),
                 peer_name_concurrency: 12,
                 cgroup_stats: true,
+                machine_cgroup_stats: false,
                 cgroup_allowlist: HashSet::from([String::from("foo"), String::from("bar")]),
                 cgroup_blocklist: HashSet::from([String::from("foo2")]),
             },

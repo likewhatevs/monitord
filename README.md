@@ -199,9 +199,12 @@ user_stats = false
 peer_stats = false
 # Only report peers that own a well-known bus name when peer_stats is on
 peer_well_known_names_only = false
-# dbus.cgroup.* stats is an aggregation of peer_stats by cgroup
-# by dbus-broker
+# Max concurrent lookups for peer names or machine peer credentials
+peer_name_concurrency = 8
+# Group dbus-broker peers by cgroup
 cgroup_stats = false
+# Include container buses when cgroup_stats is enabled
+machine_cgroup_stats = true
 
 # Grab networkd stats from files + networkctl
 [networkd]
@@ -1108,6 +1111,18 @@ unattributed system-broker count, not proof that root owns those descriptors.
   </policy>
 </busconfig>
 ```
+
+With `[dbus] cgroup_stats = true`, monitord groups peers by cgroup on the host
+and on monitored containers. Set `machine_cgroup_stats = false` for host-only
+cgroup accounting. Individual peer and user counters have their own settings.
+
+On a container bus, monitord calls `GetConnectionCredentials` for each peer.
+dbus-broker v34 and later can return a `ProcessFD` identifying the process
+across PID namespaces. Only peers with a verifiable process FD and a readable
+cgroup contribute to container cgroup totals. Cgroup names use the path visible
+to monitord, which can include the container’s host scope. The existing
+`peer_name_concurrency` setting bounds these credential requests.
+[dbus-broker v34 release notes](https://github.com/bus1/dbus-broker/releases/tag/v34)
 
 ## Development
 

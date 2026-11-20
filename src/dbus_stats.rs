@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use futures_util::{stream, StreamExt};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -16,7 +18,7 @@ use tracing::{debug, error};
 use uzers::get_user_by_uid;
 use zbus::fdo::{DBusProxy, StatsProxy};
 use zbus::names::BusName;
-use zbus::{Dict, OwnedVariant, Variant};
+use zbus::{Array, Dict, OwnedVariant, Structure, Variant};
 
 use crate::MachineStats;
 
@@ -92,16 +94,54 @@ impl DBusBrokerPeerAccounting {
             .process_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing process_id"))?;
 
-        let path = format!("/proc/{}/cgroup", pid);
-        let content = fs::read_to_string(&path)?;
-
-        // ex: 0::/system.slice/metalos.classic.metald.service
-        let cgroup = content.strip_prefix("0::").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "unexpected cgroup format")
-        })?;
-
-        Ok(cgroup.trim().trim_matches('/').replace('/', "-"))
+        read_cgroup_name(pid)
     }
+
+    async fn machine_cgroup_name(&self, proxy: &DBusProxy<'_>) -> anyhow::Result<String> {
+        // A unique bus name identifies one connection for the lifetime of the bus.
+        let name = zbus::names::UniqueName::try_from(self.id.as_str())?;
+        let credentials = proxy.get_connection_credentials(name.into()).await?;
+        let fd = credentials
+            .process_fd()
+            .ok_or_else(|| anyhow::anyhow!("missing ProcessFD"))?;
+        Ok(cgroup_from_pidfd(fd.as_fd())?)
+    }
+}
+
+fn read_cgroup_name(pid: u32) -> io::Result<String> {
+    let content = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    // ex: 0::/system.slice/metalos.classic.metald.service
+    let cgroup = content
+        .strip_prefix("0::")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unexpected cgroup format"))?;
+    Ok(cgroup.trim().trim_matches('/').replace('/', "-"))
+}
+
+fn cgroup_from_pidfd(fd: BorrowedFd<'_>) -> io::Result<String> {
+    // fdinfo reports the PID in the namespace of this procfs mount.
+    let fdinfo = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
+    let read_pid = || {
+        fs::read_to_string(&fdinfo)?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Pid:")?
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&pid| pid > 0)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer process unavailable"))
+    };
+    let pid = read_pid()?;
+    let name = read_cgroup_name(pid)?;
+    // If the peer exited, its numeric PID could have been reused during the read.
+    if read_pid()? != pid {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "peer process changed",
+        ));
+    }
+    Ok(name)
 }
 
 /// Aggregated D-Bus resource accounting grouped by cgroup.
@@ -290,69 +330,50 @@ fn proc_cmdline_args(path: &Path) -> io::Result<Vec<String>> {
         .collect())
 }
 
-fn proc_pid_dirs(proc_root: &Path) -> io::Result<Vec<(u32, std::path::PathBuf)>> {
-    let mut result = Vec::new();
-    for entry in fs::read_dir(proc_root)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        result.push((pid, entry.path()));
-    }
-    Ok(result)
+fn is_broker_cmdline(path: &Path) -> bool {
+    proc_cmdline_args(&path.join("cmdline"))
+        .is_ok_and(|args| args.first().is_some_and(|arg| arg.ends_with("dbus-broker")))
 }
 
-fn find_system_dbus_broker_pid(proc_root: &Path) -> io::Result<Option<u32>> {
-    let pid_dirs = proc_pid_dirs(proc_root)?;
-    let mut launcher_pids = Vec::new();
+fn proc_fd_path(dir: &fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
 
-    for (pid, path) in &pid_dirs {
-        let args = match proc_cmdline_args(&path.join("cmdline")) {
-            Ok(args) => args,
-            Err(_) => continue,
-        };
-
-        let is_system_launcher = args
-            .first()
-            .map(|arg| arg.ends_with("dbus-broker-launch"))
-            .unwrap_or(false)
-            && (args
-                .windows(2)
-                .any(|window| window[0] == "--scope" && window[1] == "system")
-                || args.iter().any(|arg| arg == "--scope=system"));
-
-        if is_system_launcher {
-            launcher_pids.push(*pid);
-        }
-    }
-
-    for (pid, path) in &pid_dirs {
-        let args = match proc_cmdline_args(&path.join("cmdline")) {
-            Ok(args) => args,
-            Err(_) => continue,
-        };
-
-        let is_broker = args
-            .first()
-            .map(|arg| arg.ends_with("dbus-broker"))
-            .unwrap_or(false);
-        if !is_broker {
+fn find_system_dbus_broker(proc_root: &Path) -> io::Result<Option<fs::File>> {
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        if !name.as_encoded_bytes().iter().all(u8::is_ascii_digit) || !is_broker_cmdline(&path) {
             continue;
         }
 
-        let stat = match fs::read_to_string(path.join("stat")) {
-            Ok(stat) => stat,
-            Err(_) => continue,
+        // Pin the candidate and recheck its identity. The numeric PID can be
+        // reused between reads, including while we walk its descriptors.
+        let Ok(dir) = fs::File::open(path) else {
+            continue;
+        };
+        let path = proc_fd_path(&dir);
+        if !is_broker_cmdline(&path) {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            continue;
         };
         let Some(ppid) = parse_ppid_from_stat(&stat) else {
             continue;
         };
-        if launcher_pids.contains(&ppid) {
-            return Ok(Some(*pid));
+        let Ok(parent) = proc_cmdline_args(&proc_root.join(ppid.to_string()).join("cmdline"))
+        else {
+            continue;
+        };
+        if parent
+            .first()
+            .is_some_and(|arg| arg.ends_with("dbus-broker-launch"))
+            && (parent.windows(2).any(|args| args == ["--scope", "system"])
+                || parent.iter().any(|arg| arg == "--scope=system"))
+        {
+            return Ok(Some(dir));
         }
     }
 
@@ -378,9 +399,10 @@ fn is_stale_pidfd(fd_path: &Path, fdinfo_path: &Path) -> bool {
     })
 }
 
-fn count_stale_pidfds(proc_root: &Path, pid: u32) -> io::Result<u32> {
-    let fd_dir = proc_root.join(pid.to_string()).join("fd");
-    let fdinfo_dir = proc_root.join(pid.to_string()).join("fdinfo");
+fn count_stale_pidfds(dir: &fs::File) -> io::Result<u32> {
+    let path = proc_fd_path(dir);
+    let fd_dir = path.join("fd");
+    let fdinfo_dir = path.join("fdinfo");
     let mut count: u32 = 0;
 
     for entry in fs::read_dir(fdinfo_dir)? {
@@ -395,63 +417,52 @@ fn count_stale_pidfds(proc_root: &Path, pid: u32) -> io::Result<u32> {
     Ok(count)
 }
 
-#[cfg(test)]
-fn collect_system_dbus_broker_stale_fds_from_proc(proc_root: &Path) -> io::Result<Option<u32>> {
-    let Some(pid) = find_system_dbus_broker_pid(proc_root)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(count_stale_pidfds(proc_root, pid)?))
-}
-
 fn collect_system_dbus_broker_stale_fds_with_cache(
     proc_root: &Path,
-    broker_pid_cache: &Mutex<Option<u32>>,
+    broker_cache: &Mutex<Option<Arc<fs::File>>>,
 ) -> io::Result<Option<u32>> {
-    let cached_pid = *broker_pid_cache
-        .lock()
-        .map_err(|_| io::Error::other("dbus-broker pid cache poisoned"))?;
-
-    if let Some(pid) = cached_pid {
-        match count_stale_pidfds(proc_root, pid) {
+    let lock_cache = || {
+        broker_cache
+            .lock()
+            .map_err(|_| io::Error::other("dbus-broker cache poisoned"))
+    };
+    let cached = lock_cache()?.clone();
+    if let Some(dir) = cached {
+        match count_stale_pidfds(&dir) {
             Ok(count) => return Ok(Some(count)),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if let Ok(mut cached_pid) = broker_pid_cache.lock() {
-                    if *cached_pid == Some(pid) {
-                        *cached_pid = None;
-                    }
+            Err(err) if proc_entry_gone(&err) => {
+                let mut cached = lock_cache()?;
+                if cached
+                    .as_ref()
+                    .is_some_and(|other| Arc::ptr_eq(other, &dir))
+                {
+                    *cached = None;
                 }
             }
             Err(err) => return Err(err),
         }
     }
 
-    let Some(pid) = find_system_dbus_broker_pid(proc_root)? else {
+    let Some(dir) = find_system_dbus_broker(proc_root)? else {
         return Ok(None);
     };
-
-    let count = count_stale_pidfds(proc_root, pid)?;
-    let mut cached_pid = broker_pid_cache
-        .lock()
-        .map_err(|_| io::Error::other("dbus-broker pid cache poisoned"))?;
-    *cached_pid = Some(pid);
-
+    let count = count_stale_pidfds(&dir)?;
+    *lock_cache()? = Some(Arc::new(dir));
     Ok(Some(count))
 }
 
+fn proc_entry_gone(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
 fn is_expected_procfs_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-    )
+    proc_entry_gone(err) || err.kind() == io::ErrorKind::PermissionDenied
 }
 
 fn collect_system_dbus_broker_stale_fds() -> Option<u32> {
-    static SYSTEM_DBUS_BROKER_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+    static SYSTEM_DBUS_BROKER: Mutex<Option<Arc<fs::File>>> = Mutex::new(None);
 
-    let broker_pid_cache = SYSTEM_DBUS_BROKER_PID.get_or_init(|| Mutex::new(None));
-
-    match collect_system_dbus_broker_stale_fds_with_cache(Path::new("/proc"), broker_pid_cache) {
+    match collect_system_dbus_broker_stale_fds_with_cache(Path::new("/proc"), &SYSTEM_DBUS_BROKER) {
         Ok(stale_fds) => stale_fds,
         Err(err) => {
             if is_expected_procfs_error(&err) {
@@ -472,101 +483,63 @@ fn get_u32(dict: &Dict, key: &str) -> Option<u32> {
 
 fn get_u32_vec(dict: &Dict, key: &str) -> Option<Vec<u32>> {
     let value_key: Variant = key.into();
-    dict.get(&value_key).ok().and_then(|v| match v.flatten() {
-        Some(Variant::Array(array)) => {
-            let vec: Vec<u32> = array
-                .iter()
-                .filter_map(|item| {
-                    if let Variant::U32(num) = item {
-                        Some(*num)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            Some(vec)
-        }
-        _ => None,
-    })
+    let array = dict.get::<_, &Array>(&value_key).ok()??;
+    Some(
+        array
+            .iter()
+            .filter_map(|item| u32::try_from(item).ok())
+            .collect(),
+    )
 }
 
-/* Parse DBusBrokerPeerAccounting from OwnedVariant.
- * Expected structure:
- * struct {
- *     string ":1.2197907"
- *     array [
- *         dict entry(
- *              string "UnixUserID"
- *              variant uint32 0
- *         )
- *         ... other fields
- *     ]
- *     array [
- *         dict entry(
- *              string "NameObjects"
- *              uint32 1
- *         )
- *         ... other fields
- *     ]
- * }
- */
-
+/// PeerAccounting rows contain a unique name, a credentials dict and a stats dict.
 fn parse_peer_struct(
     peer_value: &Variant,
     well_known_to_peer_names: &HashMap<String, String>,
 ) -> Option<DBusBrokerPeerAccounting> {
-    let peer_struct = match peer_value {
-        Variant::Structure(peer_struct) => peer_struct,
-        _ => return None,
+    let peer = <&Structure>::try_from(peer_value).ok()?;
+    let [Variant::Str(id), Variant::Dict(credentials), Variant::Dict(stats), ..] = peer.fields()
+    else {
+        return None;
     };
-
-    match peer_struct.fields() {
-        [Variant::Str(id), Variant::Dict(credentials), Variant::Dict(stats), ..] => {
-            Some(DBusBrokerPeerAccounting {
-                id: id.to_string(),
-                well_known_name: well_known_to_peer_names.get(id.as_str()).cloned(),
-                unix_user_id: get_u32(credentials, "UnixUserID"),
-                process_id: get_u32(credentials, "ProcessID"),
-                unix_group_ids: get_u32_vec(credentials, "UnixGroupIDs"),
-                name_objects: get_u32(stats, "NameObjects"),
-                match_bytes: get_u32(stats, "MatchBytes"),
-                matches: get_u32(stats, "Matches"),
-                reply_objects: get_u32(stats, "ReplyObjects"),
-                incoming_bytes: get_u32(stats, "IncomingBytes"),
-                incoming_fds: get_u32(stats, "IncomingFds"),
-                outgoing_bytes: get_u32(stats, "OutgoingBytes"),
-                outgoing_fds: get_u32(stats, "OutgoingFds"),
-                activation_request_bytes: get_u32(stats, "ActivationRequestBytes"),
-                activation_request_fds: get_u32(stats, "ActivationRequestFds"),
-            })
-        }
-        _ => None,
-    }
+    Some(DBusBrokerPeerAccounting {
+        id: id.to_string(),
+        well_known_name: well_known_to_peer_names.get(id.as_str()).cloned(),
+        unix_user_id: get_u32(credentials, "UnixUserID"),
+        process_id: get_u32(credentials, "ProcessID"),
+        unix_group_ids: get_u32_vec(credentials, "UnixGroupIDs"),
+        name_objects: get_u32(stats, "NameObjects"),
+        match_bytes: get_u32(stats, "MatchBytes"),
+        matches: get_u32(stats, "Matches"),
+        reply_objects: get_u32(stats, "ReplyObjects"),
+        incoming_bytes: get_u32(stats, "IncomingBytes"),
+        incoming_fds: get_u32(stats, "IncomingFds"),
+        outgoing_bytes: get_u32(stats, "OutgoingBytes"),
+        outgoing_fds: get_u32(stats, "OutgoingFds"),
+        activation_request_bytes: get_u32(stats, "ActivationRequestBytes"),
+        activation_request_fds: get_u32(stats, "ActivationRequestFds"),
+    })
 }
 
 async fn parse_peer_accounting(
     connection: &zbus::Connection,
     config: &crate::config::Config,
     owned_value: Option<&OwnedVariant>,
+    collect_cgroups: bool,
 ) -> Result<Option<Vec<DBusBrokerPeerAccounting>>, MonitordDbusStatsError> {
-    // need to keep collecting peer stats when cgroup_stats=true
-    // since cgroup_stats is a derivative of peer stats
-    if !config.dbus_stats.peer_stats && !config.dbus_stats.cgroup_stats {
+    if !config.dbus_stats.peer_stats && !collect_cgroups {
         return Ok(None);
     }
 
-    let value: &Variant = match owned_value {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some(peers_value) = owned_value.and_then(|value| <&Array>::try_from(value).ok()) else {
+        return Ok(None);
     };
 
-    let peers_value = match value {
-        Variant::Array(peers_value) => peers_value,
-        _ => return Ok(None),
+    let well_known_to_peer_names = if config.dbus_stats.peer_stats {
+        get_well_known_to_peer_names(connection, config).await?
+    } else {
+        HashMap::new()
     };
-
-    let well_known_to_peer_names = get_well_known_to_peer_names(connection, config).await?;
 
     let result = peers_value
         .iter()
@@ -615,113 +588,87 @@ fn filter_and_collect_peer_accounting(
     Some(result)
 }
 
-fn filter_and_collect_cgroup_accounting(
+async fn filter_and_collect_cgroup_accounting(
     config: &crate::config::Config,
-    peers: Option<&Vec<DBusBrokerPeerAccounting>>,
+    peers: &[DBusBrokerPeerAccounting],
+    machine_bus: Option<&zbus::Connection>,
 ) -> Option<HashMap<String, DBusBrokerCGroupAccounting>> {
-    // reject collecting cgroup stats when told so
-    if !config.dbus_stats.cgroup_stats {
-        return None;
-    }
-
-    let mut result: HashMap<String, DBusBrokerCGroupAccounting> = HashMap::new();
-
-    for peer in peers?.iter() {
-        let cgroup_name = match peer.get_cgroup_name() {
-            Ok(name) => name,
-            Err(err) => {
-                error!("Failed to get cgroup name for peer {}: {}", peer.id, err);
-                continue;
-            }
-        };
-
-        if config.dbus_stats.cgroup_blocklist.contains(&cgroup_name) {
-            continue;
-        }
-
-        if !config.dbus_stats.cgroup_allowlist.is_empty()
-            && !config.dbus_stats.cgroup_allowlist.contains(&cgroup_name)
+    let mut result = HashMap::new();
+    let mut add_peer = |name: String, peer: &DBusBrokerPeerAccounting| {
+        if config.dbus_stats.cgroup_blocklist.contains(&name)
+            || (!config.dbus_stats.cgroup_allowlist.is_empty()
+                && !config.dbus_stats.cgroup_allowlist.contains(&name))
         {
-            continue;
+            return;
         }
+        result
+            .entry(name.clone())
+            .or_insert_with(|| DBusBrokerCGroupAccounting {
+                name,
+                ..Default::default()
+            })
+            .combine_with_peer(peer);
+    };
 
-        let entry =
-            result
-                .entry(cgroup_name.clone())
-                .or_insert_with(|| DBusBrokerCGroupAccounting {
-                    name: cgroup_name,
-                    ..Default::default()
-                });
-
-        entry.combine_with_peer(peer);
+    if let Some(bus) = machine_bus {
+        let proxy = DBusProxy::builder(bus)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .ok()?;
+        let limit = usize::try_from(config.dbus_stats.peer_name_concurrency)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut lookups = stream::iter(0..peers.len())
+            .map(|i| {
+                let peer = &peers[i];
+                let proxy = &proxy;
+                async move { (peer, peer.machine_cgroup_name(proxy).await) }
+            })
+            .buffer_unordered(limit);
+        while let Some((peer, name)) = lookups.next().await {
+            match name {
+                Ok(name) => add_peer(name, peer),
+                Err(err) => debug!("No machine cgroup for peer {}: {}", peer.id, err),
+            }
+        }
+    } else {
+        for peer in peers {
+            match peer.get_cgroup_name() {
+                Ok(name) => add_peer(name, peer),
+                Err(err) => error!("Failed to get cgroup name for peer {}: {}", peer.id, err),
+            }
+        }
     }
 
     Some(result)
 }
 
-/* Parse DBusBrokerUserAccounting from OwnedVariant.
- * Expected structure:
- * struct {
- *     uint32 0
- *     array [
- *         struct {
- *             string "Bytes"
- *             uint32 536843240
- *             uint32 536870912
- *         }
- *         ... more fields
- *     ]
- *     # TODO parse usages, ignoring for now
- *     # see src/bus/driver.c:2258
- *     # the part below is not parsed
- *     array [
- *         dict entry(
- *             uint32 0
- *             array [
- *             dict entry(
- *                 string "Bytes"
- *                 uint32 27672
- *             )
- *             ... more fields
- *             ]
- *         )
- *     ]
- * }
- */
-
+/// UserAccounting rows contain a UID and (resource, current, maximum) limits.
+/// Ignore the per-user usage breakdown following the limits.
 fn parse_user_struct(user_value: &Variant) -> Option<DBusBrokerUserAccounting> {
-    let user_struct = match user_value {
-        Variant::Structure(user_struct) => user_struct,
-        _ => return None,
+    let row = <&Structure>::try_from(user_value).ok()?;
+    let [Variant::U32(uid), Variant::Array(limits), ..] = row.fields() else {
+        return None;
     };
-
-    match user_struct.fields() {
-        [Variant::U32(uid), Variant::Array(user_stats), ..] => {
-            let mut user = DBusBrokerUserAccounting::new(*uid);
-            for user_stat in user_stats.iter() {
-                if let Variant::Structure(user_stat) = user_stat {
-                    if let [Variant::Str(name), Variant::U32(cur), Variant::U32(max), ..] =
-                        user_stat.fields()
-                    {
-                        let pair = CurMaxPair {
-                            cur: *cur,
-                            max: *max,
-                        };
-                        match name.as_str() {
-                            "Bytes" => user.bytes = Some(pair),
-                            "Fds" => user.fds = Some(pair),
-                            "Matches" => user.matches = Some(pair),
-                            "Objects" => user.objects = Some(pair),
-                            _ => {} // ignore other fields
-                        }
-                    }
-                }
-            }
-
-            Some(user)
+    let mut user = DBusBrokerUserAccounting::new(*uid);
+    for limit in limits.iter().filter_map(|v| <&Structure>::try_from(v).ok()) {
+        let [Variant::Str(name), Variant::U32(cur), Variant::U32(max), ..] = limit.fields() else {
+            continue;
+        };
+        let pair = CurMaxPair {
+            cur: *cur,
+            max: *max,
+        };
+        match name.as_str() {
+            "Bytes" => user.bytes = Some(pair),
+            "Fds" => user.fds = Some(pair),
+            "Matches" => user.matches = Some(pair),
+            "Objects" => user.objects = Some(pair),
+            _ => {}
         }
-        _ => None,
     }
+    Some(user)
 }
 
 fn parse_user_accounting(
@@ -733,11 +680,7 @@ fn parse_user_accounting(
         return None;
     }
 
-    let value: &Variant = owned_value;
-    let users_value = match value {
-        Variant::Array(users_value) => users_value,
-        _ => return None,
-    };
+    let users_value = <&Array>::try_from(owned_value).ok()?;
 
     let result = users_value
         .iter()
@@ -803,14 +746,14 @@ async fn get_well_known_to_peer_names(
 async fn parse_dbus_stats_inner(
     config: &crate::config::Config,
     connection: &zbus::Connection,
-    collect_stale_fds: bool,
+    host_bus: bool,
 ) -> Result<DBusStats, MonitordDbusStatsError> {
     let stats_proxy = StatsProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;
 
-    let stale_fds_task = if collect_stale_fds && config.dbus_stats.stale_fd_stats {
+    let stale_fds_task = if host_bus && config.dbus_stats.stale_fd_stats {
         Some(tokio::task::spawn_blocking(
             collect_system_dbus_broker_stale_fds,
         ))
@@ -819,12 +762,23 @@ async fn parse_dbus_stats_inner(
     };
 
     let stats = stats_proxy.get_stats().await?;
+    let collect_cgroups =
+        config.dbus_stats.cgroup_stats && (host_bus || config.dbus_stats.machine_cgroup_stats);
     let peers = parse_peer_accounting(
         connection,
         config,
         stats.rest().get("org.bus1.DBus.Debug.Stats.PeerAccounting"),
+        collect_cgroups,
     )
     .await?;
+
+    let cgroups = match peers.as_deref() {
+        Some(peers) if collect_cgroups => {
+            filter_and_collect_cgroup_accounting(config, peers, (!host_bus).then_some(connection))
+                .await
+        }
+        _ => None,
+    };
 
     let stale_fds = match stale_fds_task {
         Some(task) => match task.await {
@@ -864,7 +818,7 @@ async fn parse_dbus_stats_inner(
 
         // attempt to parse dbus-broker specific stats
         dbus_broker_peer_accounting: filter_and_collect_peer_accounting(config, peers.as_ref()),
-        dbus_broker_cgroup_accounting: filter_and_collect_cgroup_accounting(config, peers.as_ref()),
+        dbus_broker_cgroup_accounting: cgroups,
         dbus_broker_user_accounting,
     };
 
@@ -890,8 +844,7 @@ pub async fn update_dbus_stats(
 
 /// Async wrapper for nested machine/container buses.
 ///
-/// Stale pidfd accounting is read from host procfs and currently cannot be
-/// attributed to nested machine D-Bus brokers, so machine stats skip it.
+/// Resolve machine peer cgroups using process descriptors supplied by the broker.
 pub async fn update_machine_dbus_stats(
     config: Arc<crate::config::Config>,
     connection: zbus::Connection,
@@ -904,9 +857,9 @@ async fn update_dbus_stats_inner(
     config: Arc<crate::config::Config>,
     connection: zbus::Connection,
     locked_machine_stats: Arc<RwLock<MachineStats>>,
-    collect_stale_fds: bool,
+    host_bus: bool,
 ) -> anyhow::Result<()> {
-    match parse_dbus_stats_inner(&config, &connection, collect_stale_fds).await {
+    match parse_dbus_stats_inner(&config, &connection, host_bus).await {
         Ok(dbus_stats) => {
             let mut machine_stats = locked_machine_stats.write().await;
             machine_stats.dbus_stats = Some(dbus_stats)
@@ -1006,9 +959,47 @@ mod tests {
             "Pid:\t-1\nNSpid:\t-1\n",
         );
 
+        let cache = Mutex::new(None);
+        let collect =
+            || collect_system_dbus_broker_stale_fds_with_cache(proc_root, &cache).unwrap();
+        assert_eq!(collect(), Some(1));
+        assert_eq!(collect(), Some(1));
+    }
+
+    #[test]
+    fn test_cached_broker_ignores_reused_pid() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let cache = Mutex::new(None);
+        let collect = || collect_system_dbus_broker_stale_fds_with_cache(root, &cache).unwrap();
+        write_fake_proc_process(root, 10, 1, &["dbus-broker-launch", "--scope=system"]);
+        write_fake_proc_process(root, 11, 10, &["dbus-broker"]);
+        assert_eq!(collect(), Some(0));
+
+        fs::remove_dir_all(root.join("11")).unwrap();
+        write_fake_proc_process(root, 11, 1, &["another-process"]);
+        write_fake_fd(root, 11, 0, "anon_inode:[pidfd]", "Pid:\t-1\n");
+        assert_eq!(collect(), None);
+        write_fake_proc_process(root, 12, 10, &["dbus-broker"]);
+        assert_eq!(collect(), Some(0));
+    }
+
+    #[test]
+    fn test_cgroup_from_pidfd_rejects_reaped_peer() {
+        use rustix::process::{pidfd_open, Pid, PidfdFlags};
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cat").stdin(Stdio::piped()).spawn().unwrap();
+        let pid = Pid::from_child(&child);
+        let fd = pidfd_open(pid, PidfdFlags::empty()).unwrap();
         assert_eq!(
-            collect_system_dbus_broker_stale_fds_from_proc(proc_root).expect("collect stale fds"),
-            Some(1)
+            cgroup_from_pidfd(fd.as_fd()).unwrap(),
+            read_cgroup_name(child.id()).unwrap()
+        );
+        child.wait().unwrap();
+        assert_eq!(
+            cgroup_from_pidfd(fd.as_fd()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
     }
 
@@ -1093,6 +1084,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_peer_struct_accepts_extra_fields() {
+        let credentials = HashMap::from([("UnixUserID", Variant::new(42u32))]);
+        let stats = HashMap::from([("NameObjects", 7u32)]);
+        let row = Variant::Structure(Structure::from((":1.23", credentials, stats, 1u32)));
+        let peer = parse_peer_struct(&row, &HashMap::new()).expect("parse extended peer row");
+        assert_eq!(peer.unix_user_id, Some(42));
+        assert_eq!(peer.name_objects, Some(7));
+    }
+
+    #[test]
+    fn test_parse_user_struct_accepts_extra_fields() {
+        let limits = vec![("Bytes", 5u32, 10u32, 1u32), ("NewLimit", 1, 2, 0)];
+        let row = Variant::Structure(Structure::from((999_999u32, limits, 1u32)));
+        let user = parse_user_struct(&row).expect("parse user with extended limits");
+        assert_eq!(user.bytes, Some(CurMaxPair { cur: 5, max: 10 }));
+
+        let row = Variant::Structure(Structure::from((999_999u32, vec![1u32])));
+        let user = parse_user_struct(&row).expect("skip malformed limit");
+        assert_eq!(user.bytes, None);
+    }
+
+    #[test]
     fn test_get_u32_and_get_u32_vec() {
         // dbus-broker credentials/stats are a{sv}, so values are variant-wrapped
         let mut dict = Dict::new(&zbus::Signature::Str, &zbus::Signature::Variant);
@@ -1108,6 +1121,8 @@ mod tests {
         assert_eq!(get_u32_vec(&dict, "UnixGroupIDs"), Some(vec![1, 2]));
         assert_eq!(get_u32_vec(&dict, "UnixUserID"), None);
         assert_eq!(get_u32_vec(&dict, "Missing"), None);
+        dict.add("OtherIDs", Variant::new(vec![1u64])).unwrap();
+        assert_eq!(get_u32_vec(&dict, "OtherIDs"), Some(Vec::new()));
     }
 
     #[test]
