@@ -334,9 +334,10 @@ pub struct UnitDiscovery {
     pub status_errno: HashMap<String, i32>,
 }
 
-/// More endpoints than this and a [`ReloadCache`] starts over, so machines
-/// coming and going cannot grow it forever.
+/// Keep at most this many endpoints. Once full, active entries retain their
+/// slots until they go five minutes without a successful update.
 const MAX_CACHED_ENDPOINTS: usize = 64;
+const ENDPOINT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-unit answers from the previous cycle, per varlink endpoint, that only
 /// change when unit files are reloaded.
@@ -353,7 +354,7 @@ const MAX_CACHED_ENDPOINTS: usize = 64;
 /// so nothing owned by that call would outlive a cycle.
 #[derive(Debug, smart_default::SmartDefault)]
 struct ReloadCache<V> {
-    endpoints: HashMap<String, (u64, HashMap<String, V>)>,
+    endpoints: HashMap<String, (u64, HashMap<String, V>, Instant)>,
 }
 
 /// Oneshot verdicts. The oneshot override wants `Service.Type` for every
@@ -400,7 +401,9 @@ impl<V> ReloadCache<V> {
     /// `store` puts back the set this cycle actually used.
     fn take(&mut self, endpoint: &str, reload_count: Option<u64>) -> HashMap<String, V> {
         match (self.endpoints.remove(endpoint), reload_count) {
-            (Some((cached_count, entries)), Some(reload_count)) if cached_count == reload_count => {
+            (Some((cached_count, entries, _)), Some(reload_count))
+                if cached_count == reload_count =>
+            {
                 entries
             }
             _ => HashMap::new(),
@@ -414,10 +417,20 @@ impl<V> ReloadCache<V> {
             debug!("No usable ReloadCount, not caching unit details for {endpoint}");
             return;
         };
-        if self.endpoints.len() >= MAX_CACHED_ENDPOINTS {
-            self.endpoints.clear();
+        if entries.is_empty() {
+            return;
         }
-        self.endpoints.insert(endpoint, (reload_count, entries));
+        let now = Instant::now();
+        if self.endpoints.len() >= MAX_CACHED_ENDPOINTS && !self.endpoints.contains_key(&endpoint) {
+            self.endpoints.retain(|_, (_, _, last_used)| {
+                now.duration_since(*last_used) < ENDPOINT_IDLE_TIMEOUT
+            });
+            if self.endpoints.len() >= MAX_CACHED_ENDPOINTS {
+                return;
+            }
+        }
+        self.endpoints
+            .insert(endpoint, (reload_count, entries, now));
     }
 }
 
@@ -1230,10 +1243,26 @@ mod tests {
     #[test]
     fn test_oneshot_cache_stays_bounded() {
         let mut cache = ReloadCache::<bool>::default();
-        for leader in 0..MAX_CACHED_ENDPOINTS * 3 {
-            cache.store(format!("machine {leader}"), Some(1), HashMap::new());
-            assert!(cache.endpoints.len() <= MAX_CACHED_ENDPOINTS);
+        for leader in 0..MAX_CACHED_ENDPOINTS {
+            cache.store(
+                format!("machine {leader}"),
+                Some(1),
+                types(&[("a.service", true)]),
+            );
         }
+        cache.store("extra".into(), Some(1), types(&[("b.service", true)]));
+        assert!(!cache.endpoints.contains_key("extra"));
+        assert_eq!(cache.endpoints.len(), MAX_CACHED_ENDPOINTS);
+
+        for (_, _, last_used) in cache.endpoints.values_mut() {
+            *last_used -= ENDPOINT_IDLE_TIMEOUT;
+        }
+        for leader in 0..MAX_CACHED_ENDPOINTS {
+            let name = format!("replacement {leader}");
+            cache.store(name.clone(), Some(1), types(&[("c.service", true)]));
+            assert!(cache.endpoints.contains_key(&name));
+        }
+        assert_eq!(cache.endpoints.len(), MAX_CACHED_ENDPOINTS);
     }
 
     fn changes(entries: &[(&str, u64)]) -> HashMap<String, u64> {
