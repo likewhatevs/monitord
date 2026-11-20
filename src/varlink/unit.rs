@@ -14,6 +14,7 @@
 //! D-Bus properties return for the same unit).
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use zlink::{proxy, ReplyError};
 
 /// Proxy trait for calling methods on the io.systemd.Unit interface.
@@ -182,7 +183,7 @@ pub struct ProcessId {
 }
 
 /// Errors that can occur in the io.systemd.Unit interface.
-#[derive(Debug, Clone, PartialEq, ReplyError)]
+#[derive(Error, Debug, Clone, PartialEq, ReplyError)]
 #[zlink(interface = "io.systemd.Unit")]
 pub enum UnitError {
     /// No unit by that name is loaded.
@@ -202,5 +203,3 @@ impl std::fmt::Display for UnitError {
         }
     }
 }
-
-impl std::error::Error for UnitError {}
