@@ -80,7 +80,7 @@ pub fn filter_machines(
 /// `io.systemd.Machine.List` varlink API (systemd v257+) when enabled,
 /// falling back to machined's D-Bus API. Records the transport used in the
 /// host's `varlink_usage.machines` gauge.
-pub async fn get_machines(
+pub(crate) async fn get_machines(
     config: &crate::config::Config,
     dbus_cell: &crate::DbusCell,
     host_stats: &RwLock<MachineStats>,
@@ -349,7 +349,7 @@ fn machine_endpoint(
     })
 }
 
-pub async fn update_machines_stats(
+pub(crate) async fn update_machines_stats(
     config: Arc<crate::config::Config>,
     dbus_cell: crate::DbusCell,
     host_stats: Arc<RwLock<MachineStats>>,

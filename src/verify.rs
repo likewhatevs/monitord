@@ -214,7 +214,7 @@ pub async fn get_verify_stats(
 /// Collect verification stats, resolving the shared D-Bus connection only
 /// on a D-Bus code path: the varlink enumeration runs first and a bus-less
 /// host never connects at all.
-pub async fn update_verify_stats(
+pub(crate) async fn update_verify_stats(
     dbus: crate::DbusCell,
     dbus_timeout: u64,
     locked_machine_stats: Arc<RwLock<MachineStats>>,

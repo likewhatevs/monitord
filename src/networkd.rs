@@ -418,7 +418,7 @@ pub fn parse_interface_stats(
 /// `/sys`) — kernel truth, no IPC. The D-Bus `ListLinks` lookup remains
 /// only as a last resort for environments where sysfs is restricted but
 /// the bus is reachable.
-pub async fn parse_interface_state_files(
+pub(crate) async fn parse_interface_state_files(
     states_path: &PathBuf,
     maybe_network_int_to_name: Option<HashMap<i32, String>>,
     sysfs_root: &Path,
@@ -499,7 +499,7 @@ pub async fn parse_interface_state_files(
 /// without ever connecting, and the cell is resolved only when sysfs
 /// yields nothing usable — the same lazy pattern as
 /// `update_boot_blame_stats`.
-pub async fn update_networkd_stats(
+pub(crate) async fn update_networkd_stats(
     states_path: PathBuf,
     maybe_network_int_to_name: Option<HashMap<i32, String>>,
     sysfs_root: PathBuf,
