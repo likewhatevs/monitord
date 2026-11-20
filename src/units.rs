@@ -3,7 +3,9 @@
 //! All main systemd unit statistics. Counts of types of units, unit states and
 //! queued jobs. We also house service specific statistics and system unit states.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -111,6 +113,10 @@ pub struct SystemdUnitStats {
     pub device_units: u64,
     /// Number of units in the "failed" state (exited with error, crashed, or timed out)
     pub failed_units: u64,
+    /// Failed units matching each configured family. Absent until a listing
+    /// succeeds, or when no families are configured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed_families: BTreeMap<String, u64>,
     /// Number of units in the "inactive" state (not currently running)
     pub inactive_units: u64,
     /// Number of pending jobs queued in the systemd job scheduler
@@ -158,6 +164,39 @@ pub struct SystemdUnitStats {
     /// backfill — so `service_dbus_fetches` and `timer_dbus_fetches` may both be
     /// nonzero there. Only `state_dbus_fetches` stays zero on that path.
     pub collection_timings: UnitsCollectionTimings,
+}
+
+/// Count each failed unit name once per configured family, independently
+/// of state filters. Call only after a successful listing: an empty
+/// listing still publishes zeros.
+pub(crate) fn count_failed_families<'a>(
+    families: &BTreeMap<String, String>,
+    failed_names: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<_, _> = families.keys().map(|name| (name.clone(), 0)).collect();
+    if families.is_empty() {
+        return counts;
+    }
+    let mut seen = HashSet::new();
+    for name in failed_names {
+        if !seen.insert(name) {
+            continue;
+        }
+        for (family, pattern) in families {
+            let matches = match pattern.split_once('*') {
+                Some((prefix, suffix)) => {
+                    name.len() > prefix.len() + suffix.len()
+                        && name.starts_with(prefix)
+                        && name.ends_with(suffix)
+                }
+                None => name == pattern,
+            };
+            if matches {
+                *counts.get_mut(family).expect("configured family") += 1;
+            }
+        }
+    }
+    counts
 }
 
 /// Per-service metrics from the org.freedesktop.systemd1.Service and Unit D-Bus interfaces.
@@ -815,6 +854,13 @@ pub async fn parse_unit_state(
     // concurrent D-Bus work below — no .await, so no reason to involve the
     // per-unit tasks in it.
     let listed_units: Vec<ListedUnit> = units.into_iter().map(ListedUnit::from).collect();
+    stats.failed_families = count_failed_families(
+        &config.units.failed_families,
+        listed_units
+            .iter()
+            .filter(|unit| unit.active_state == "failed")
+            .map(|unit| unit.name.as_str()),
+    );
     for unit in &listed_units {
         parse_unit(&mut stats, unit);
     }
@@ -1028,6 +1074,7 @@ mod tests {
             automount_units: 0,
             device_units: 0,
             failed_units: 0,
+            failed_families: BTreeMap::new(),
             inactive_units: 0,
             jobs_queued: 0,
             loaded_units: 0,
@@ -1104,6 +1151,39 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_families_overlap_whole_names_and_nonempty_wildcard() {
+        let families = BTreeMap::from([
+            ("ops group/worker.1".into(), "Worker@*.service".into()),
+            ("exact".into(), "Worker@one.service".into()),
+            ("never".into(), "no-match.service".into()),
+        ]);
+        let counts = count_failed_families(
+            &families,
+            [
+                "Worker@one.service",
+                "Worker@one.service",
+                "Worker@two.service",
+                "Worker@.service",
+                "worker@one.service",
+                "prefixWorker@one.service",
+                "Worker@one.service.extra",
+            ],
+        );
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("ops group/worker.1".into(), 2),
+                ("exact".into(), 1),
+                ("never".into(), 0)
+            ])
+        );
+        assert!(count_failed_families(&families, [])
+            .values()
+            .all(|count| *count == 0));
+        assert!(count_failed_families(&BTreeMap::new(), ["failed.service"]).is_empty());
+    }
+
+    #[test]
     fn test_compute_time_in_state() {
         // Normal case: elapsed since the recorded change.
         assert_eq!(
@@ -1125,6 +1205,7 @@ mod tests {
             automount_units: 0,
             device_units: 0,
             failed_units: 0,
+            failed_families: BTreeMap::new(),
             inactive_units: 1,
             jobs_queued: 0,
             loaded_units: 1,

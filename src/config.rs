@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -133,6 +134,9 @@ pub struct UnitsConfig {
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
     pub varlink: bool,
+    /// Unit-name patterns for failed counts, keyed by family. Each pattern
+    /// matches a full name or contains one `*` matching a non-empty string.
+    pub failed_families: BTreeMap<String, String>,
     pub state_stats: bool,
     pub state_stats_allowlist: HashSet<String>,
     pub state_stats_blocklist: HashSet<String>,
@@ -159,6 +163,7 @@ impl Default for UnitsConfig {
         UnitsConfig {
             enabled: true,
             varlink: true,
+            failed_families: BTreeMap::new(),
             state_stats: false,
             state_stats_allowlist: HashSet::new(),
             state_stats_blocklist: HashSet::new(),
@@ -435,6 +440,22 @@ impl TryFrom<Ini> for Config {
         if let Some(varlink) = read_config_optional_bool(&ini_config, "units", "varlink")? {
             config.units.varlink = varlink;
         }
+        if let Some(families) = config_map.get("units.failed_families") {
+            for (family, pattern) in families {
+                let pattern = pattern.as_deref().unwrap_or("").trim();
+                if pattern.is_empty() || pattern.matches('*').count() > 1 {
+                    return Err(MonitordConfigError::InvalidValue {
+                        section: "units.failed_families".into(),
+                        key: family.clone(),
+                        reason: "expected a non-empty unit name with at most one '*'".into(),
+                    });
+                }
+                config
+                    .units
+                    .failed_families
+                    .insert(family.clone(), pattern.into());
+            }
+        }
         config.units.state_stats = read_config_bool(&ini_config, "units", "state_stats")?;
         if let Some(state_stats_allowlist) = config_map.get("units.state_stats.allowlist") {
             config.units.state_stats_allowlist = state_stats_allowlist
@@ -671,6 +692,7 @@ const DATA_SECTIONS: &[&str] = &[
     "services",
     "timers.allowlist",
     "timers.blocklist",
+    "units.failed_families",
     "units.state_stats.allowlist",
     "units.state_stats.blocklist",
     "machines.allowlist",
@@ -805,6 +827,9 @@ per_unit_concurrency = 16
 slowest_units_count = 3
 service_details_cache_max_age_secs = 600
 
+[units.failed_families]
+Worker = Worker@*.service
+
 [units.state_stats.allowlist]
 foo.service
 
@@ -893,6 +918,18 @@ io.systemd.Basic.SMBIOS
 output_format = json-flat
 "###;
 
+    fn load_ini(contents: &str) -> Ini {
+        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
+        monitord_config
+            .write_all(contents.as_bytes())
+            .expect("Unable to write out temp config file");
+        let mut ini_config = Ini::new();
+        ini_config
+            .load(monitord_config.path())
+            .expect("Unable to load ini config");
+        ini_config
+    }
+
     #[test]
     fn test_default_config() {
         assert!(Config::default().units.enabled);
@@ -932,6 +969,63 @@ output_format = json-flat
         assert!(expected_config.units.ignore_inactive_oneshot_services);
         // The systemd-report server is opt-in
         assert!(!expected_config.report.enabled);
+    }
+
+    #[test]
+    fn test_failed_family_patterns_validate_at_load() {
+        for pattern in ["", "worker@**.service", "a*b*c"] {
+            let invalid_config = format!(
+                r###"
+[monitord]
+output_format = json
+
+[units.failed_families]
+worker = {pattern}
+"###
+            );
+            let ini_config = load_ini(&invalid_config);
+            assert!(
+                matches!(
+                    Config::try_from(ini_config),
+                    Err(MonitordConfigError::InvalidValue { section, .. })
+                        if section == "units.failed_families"
+                ),
+                "{pattern}"
+            );
+        }
+
+        let failed_families_config = r###"
+[monitord]
+output_format = json
+
+[units.failed_families]
+Worker = Worker@*.service
+Exact = exact.service
+"###;
+        let ini_config = load_ini(failed_families_config);
+        assert!(unknown_config_entries(ini_config.get_map_ref()).is_empty());
+        let config: Config = ini_config.try_into().expect("Failed to parse config");
+        assert_eq!(config.units.failed_families["worker"], "Worker@*.service");
+        assert_eq!(config.units.failed_families["exact"], "exact.service");
+    }
+
+    #[test]
+    fn test_failed_family_names_follow_ini_key_rules() {
+        // Family labels are opaque keys, not unit or Varlink interface names.
+        // The INI parser folds their case but must not reject spaces or '/'.
+        let failed_families_config = r###"
+[monitord]
+output_format = json
+
+[units.failed_families]
+Ops group/Worker.1 = Worker@*.service
+"###;
+        let ini_config = load_ini(failed_families_config);
+        let config: Config = ini_config.try_into().expect("Failed to parse config");
+        assert_eq!(
+            config.units.failed_families,
+            BTreeMap::from([("ops group/worker.1".into(), "Worker@*.service".into())])
+        );
     }
 
     #[test]
@@ -1137,6 +1231,7 @@ varlink = false
             units: UnitsConfig {
                 enabled: true,
                 varlink: false,
+                failed_families: BTreeMap::from([("worker".into(), "Worker@*.service".into())]),
                 state_stats: true,
                 state_stats_allowlist: HashSet::from([String::from("foo.service")]),
                 state_stats_blocklist: HashSet::from([String::from("bar.service")]),

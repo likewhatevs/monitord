@@ -238,6 +238,14 @@ ignore_inactive_oneshot_services = true
 # systemd reloads; cgroup counters are still read every cycle. 0 disables.
 service_details_cache_max_age_secs = 300
 
+# Optional failed counts by full unit name or a pattern with one * wildcard.
+# The * matches one or more characters; patterns are case-sensitive.
+# Count all failed units, independently of state_stats and its allow/block lists.
+# Family keys are lowercased. Requires [units] enabled.
+# [units.failed_families]
+# worker = worker@*.service
+# transient-job = transient-job-*.service
+
 # Filter what services you want collect state stats for
 # If both lists are configured blocklist is preferred
 # If neither exist all units state will generate counters
@@ -341,6 +349,18 @@ enabled = false
 # noisy.service
 # broken.timer
 ```
+
+The host publishes family counts in `units.failed_families`. Each local
+container monitored through `[machines]` publishes its own counts under
+`machines.<name>.units.failed_families`.
+Patterns match the whole name, case-sensitively; overlapping families each count
+the unit. An exact name or one `*` is accepted, with `*` matching at least one
+character. Empty patterns and multiple wildcards are configuration errors.
+Every successful listing publishes zeros for families without failures. Before
+the first successful listing the map is absent. If a host listing fails, the
+daemon retains its previous sample. One-shot runs and each machine sweep start
+fresh. Without families configured, output is unchanged. The flat example
+includes two optional families.
 
 When using the provided `monitord.service`, systemd creates `/run/monitord` via
 `RuntimeDirectory=monitord` and assigns ownership to the configured service `User`/`Group`.
@@ -690,6 +710,8 @@ they are not repeated below.
   "units.active_units": 403,
   "units.automount_units": 1,
   "units.device_units": 150,
+  "units.failed_families.transient-job": 0,
+  "units.failed_families.worker": 0,
   "units.failed_units": 0,
   "units.inactive_units": 159,
   "units.jobs_queued": 0,
