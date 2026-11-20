@@ -564,7 +564,11 @@ async fn parse_peer_accounting(
         return Ok(None);
     };
 
-    let well_known_to_peer_names = get_well_known_to_peer_names(connection, config).await?;
+    let well_known_to_peer_names = if config.dbus_stats.peer_stats {
+        get_well_known_to_peer_names(connection, config).await?
+    } else {
+        HashMap::new()
+    };
 
     let result = peers_value
         .iter()
