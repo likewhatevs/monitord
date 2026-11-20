@@ -939,7 +939,6 @@ pub async fn parse_unit_state(
 
     // Keep concurrent D-Bus calls bounded on busy hosts.
     let limit = config.units.per_unit_concurrency;
-    let parent_span = tracing::Span::current();
     // Host-wide memory numbers for the `memory_available` fold, read once
     // per collection cycle and shared by every unit (rather than once per
     // service inside `parse_service`).
@@ -947,12 +946,10 @@ pub async fn parse_unit_state(
     let mut pending = listed_units.into_iter().map(|unit| {
         let config = Arc::clone(config);
         let connection = connection.clone();
-        let parent_span = parent_span.clone();
         let fs_root = fs_root.to_string();
         async move {
             let unit_collect_start = Instant::now();
-            let span =
-                tracing::debug_span!(parent: &parent_span, "unit_collect", unit = %unit.name);
+            let span = tracing::debug_span!("unit_collect", unit = %unit.name);
             let mut outcome = async {
                 let mut outcome = PerUnitOutcome {
                     unit_name: unit.name.clone(),
@@ -1016,6 +1013,7 @@ pub async fn parse_unit_state(
             outcome.duration_ms = unit_collect_start.elapsed().as_secs_f64() * 1000.0;
             outcome
         }
+        .in_current_span()
     });
     let mut running = JoinSet::new();
     let mut slowest_units: Vec<(String, f64)> = Vec::new();

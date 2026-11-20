@@ -302,11 +302,8 @@ type TimedCollectorOutput = (String, anyhow::Result<()>, Duration, Duration);
 /// profile would make `catch_unwind` a no-op, so a collector panic would
 /// again take down the whole process, daemon included.
 ///
-/// `tokio::task::JoinSet::spawn` runs the future on a new task, and tracing
-/// spans do not cross task boundaries automatically — without explicitly
-/// capturing and re-attaching the caller's span here, every collector (and
-/// anything it spawns in turn, e.g. units.rs's per-unit tasks) would show up
-/// as an unrelated root trace instead of a child of the current collection run.
+/// Attach the collector span to the spawned task. When debug spans are
+/// filtered out, its events still belong to the current collection run.
 fn spawn_timed<F>(
     join_set: &mut tokio::task::JoinSet<TimedCollectorOutput>,
     name: &'static str,
@@ -315,9 +312,7 @@ fn spawn_timed<F>(
 ) where
     F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let parent_span = tracing::Span::current();
     let span = tracing::debug_span!(
-        parent: &parent_span,
         "collector",
         name,
         elapsed_ms = tracing::field::Empty,
@@ -344,7 +339,7 @@ fn spawn_timed<F>(
             recording_span.record("success", result.is_ok());
             (name.to_string(), result, start_offset, elapsed)
         }
-        .instrument(span),
+        .instrument(span.or_current()),
     );
 }
 
@@ -1044,6 +1039,26 @@ enabled = true
         assert_eq!(daemon_sleep_time_ms(30_000, 30_000), 0);
         assert_eq!(daemon_sleep_time_ms(30_000, 30_001), 0);
         assert_eq!(daemon_sleep_time_ms(0, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_timed_keeps_run_span_when_debug_is_filtered() {
+        use tracing_subscriber::prelude::*;
+
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::INFO);
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let run = tracing::info_span!("stat_collector_run");
+        let run_id = run.id().expect("run span enabled");
+        let mut tasks = tokio::task::JoinSet::new();
+        run.in_scope(|| {
+            spawn_timed(&mut tasks, "units", Instant::now(), async move {
+                assert_eq!(tracing::Span::current().id(), Some(run_id));
+                Ok(())
+            });
+        });
+        let (_, result, _, _) = tasks.join_next().await.unwrap().unwrap();
+        result.unwrap();
     }
 
     /// A panicking collector must come back as a named failure: a `JoinError`

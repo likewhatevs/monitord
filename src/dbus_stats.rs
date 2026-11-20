@@ -777,18 +777,17 @@ async fn get_well_known_to_peer_names(
     let dbus_names = dbus_proxy.list_names().await?;
 
     let limit = config.dbus_stats.peer_name_concurrency;
-    let parent_span = tracing::Span::current();
     let mut pending = dbus_names
         .into_iter()
         .filter(|name| matches!(**name, BusName::WellKnown(_)))
         .map(|name| {
             let proxy = dbus_proxy.clone();
-            let span = tracing::debug_span!(parent: &parent_span, "peer_name_lookup", %name);
+            let span = tracing::debug_span!("peer_name_lookup", %name);
             async move {
                 let owner = proxy.get_name_owner((&name).into()).await?;
                 Ok::<_, MonitordDbusStatsError>((owner.to_string(), name.to_string()))
             }
-            .instrument(span)
+            .instrument(span.or_current())
         });
     let mut running = JoinSet::new();
     let mut result = HashMap::new();
