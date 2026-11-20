@@ -311,7 +311,8 @@ pub struct VarlinkConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReportConfig {
     /// Serve `io.systemd.Metrics` on `/run/systemd/report/io.monitord`
-    /// (or a socket-activated fd). Daemon mode only; off by default.
+    /// (or a socket-activated fd). Off by default. The binary serves only
+    /// in daemon mode; library users start `report::ReportServer` themselves.
     pub enabled: bool,
     /// Collect every `io.systemd.Metrics` source under `/run/systemd/report/`
     /// except those monitord already parses into typed stats. Off by default:
@@ -579,12 +580,6 @@ impl TryFrom<Ini> for Config {
         // [report] section
         if let Some(enabled) = read_config_optional_bool(&ini_config, "report", "enabled")? {
             config.report.enabled = enabled;
-        }
-        if config.report.enabled && !config.monitord.daemon {
-            warn!(
-                "[report] enabled=true has no effect without [monitord] daemon=true; \
-                 a one-shot run exits before systemd-report could ask"
-            );
         }
         if let Some(collect) = read_config_optional_bool(&ini_config, "report", "collect")? {
             config.report.collect = collect;

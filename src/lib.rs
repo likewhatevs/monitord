@@ -223,6 +223,9 @@ pub struct MonitordStats {
     /// keyed by source. `None` unless `[report] collect = true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<report_collector::ReportStats>,
+    /// Collection counters shared with a report server and retained across runs.
+    #[serde(skip)]
+    report_state: report::ReportState,
 }
 
 /// Print statistics in the format set in configuration
@@ -382,7 +385,14 @@ pub(crate) async fn dbus_connection(
         .map_err(MonitordError::ZbusError)
 }
 
-/// Main statistic collection function running what's required by configuration in parallel
+/// Collect the configured statistics in parallel.
+///
+/// Use one shared stats value per collection stream and run samples
+/// sequentially. A caller with its own sampling schedule must set
+/// `[monitord] daemon = false`; daemon mode loops forever. Start a
+/// [`report::ReportServer`] with the same stats to serve collection health,
+/// including counters retained across one-shot calls.
+///
 /// Takes an optional locked stats struct to update and to output stats to STDOUT or not.
 /// Takes an optional D-Bus connection. Returns `Some(connection)` if the
 /// collection cycle completed without errors (meaning the connection is reusable),
@@ -414,19 +424,6 @@ pub async fn stat_collector(
     let dbus_timeout = config.monitord.dbus_timeout;
     let mut join_set: tokio::task::JoinSet<TimedCollectorOutput> = tokio::task::JoinSet::new();
     let mut had_error;
-
-    // Counters for the systemd-report server. Kept even when the server is
-    // off: recording a run costs a few integer bumps.
-    let report_state = Arc::new(std::sync::Mutex::new(report::ReportState::default()));
-    if config.monitord.daemon && config.report.enabled {
-        if let Err(e) = report::spawn_server(
-            report::REPORT_DIR.into(),
-            locked_monitord_stats.clone(),
-            report_state.clone(),
-        ) {
-            error!("Unable to start the systemd-report server thread: {:?}", e);
-        }
-    }
 
     loop {
         let collect_start_time = Instant::now();
@@ -827,10 +824,7 @@ pub async fn stat_collector(
             monitord_stats.verify_stats = machine_stats.verify_stats.clone();
             monitord_stats.varlink_usage = machine_stats.varlink_usage.clone();
             set_stat_collection_run_time(&mut monitord_stats, elapsed_runtime);
-            report_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .record_run(&timings, had_error);
+            monitord_stats.report_state.record_run(&timings, had_error);
             monitord_stats.collector_timings = timings;
         }
 
@@ -885,6 +879,59 @@ pub async fn stat_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_report_counters_persist_across_one_shot_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ini = configparser::ini::Ini::new();
+        ini.read(format!(
+            r###"
+[monitord]
+output_format = json
+dbus_address = unix:path={}/missing-bus
+
+[varlink]
+enabled = false
+
+[report]
+enabled = true
+"###,
+            dir.path().display()
+        ))
+        .expect("Unable to load ini config");
+        let config: config::Config = ini.try_into().unwrap();
+        assert!(!config.monitord.daemon);
+        assert!(config.report.enabled);
+        let stats = Arc::new(RwLock::new(MonitordStats::default()));
+        for completed in 0..=2 {
+            let snapshot = stats.read().await;
+            let metrics = report::build_metrics(&snapshot);
+            for name in [
+                "io.monitord.collectionRunsTotal",
+                "io.monitord.collectionErrorsTotal",
+            ] {
+                assert_eq!(
+                    metrics.iter().find(|m| m.name == name).unwrap().value.0,
+                    serde_json::json!(completed)
+                );
+            }
+            assert!(serde_json::to_value(&*snapshot)
+                .unwrap()
+                .get("report_state")
+                .is_none());
+            drop(snapshot);
+            if completed < 2 {
+                assert!(tokio::time::timeout(
+                    Duration::from_secs(3),
+                    stat_collector(config.clone(), Some(stats.clone()), false, None)
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none());
+            }
+        }
+    }
 
     /// The lazy-connect contract finding 6 on #224 pins down: a failed
     /// connect is not cached, so consecutive failures each attempt (and

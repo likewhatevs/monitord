@@ -20,9 +20,11 @@ to rebuild the image without the cache and recreate the container.
 
 import argparse
 import json
-import subprocess
 import re
+import selectors
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -1498,16 +1500,25 @@ def replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
-def build_report_conf(varlink_conf: str) -> str:
-    """The varlink CI config, switched to daemon mode with [report] on.
+def build_daemon_conf(varlink_conf: str) -> str:
+    """Enable daemon mode while preserving the report serving setting.
 
-    A short refresh so several runs land within the test's polling window.
+    Use a short refresh so several runs land within the test's polling window.
     """
     conf = replace_once(varlink_conf, "daemon = false", "daemon = true")
     conf = replace_once(
         conf, "daemon_stats_refresh_secs = 60", "daemon_stats_refresh_secs = 2"
     )
-    return replace_once(conf, "[report]\nenabled = false", "[report]\nenabled = true")
+    return conf
+
+
+def build_report_conf(varlink_conf: str) -> str:
+    """The varlink CI config, switched to daemon mode with [report] on."""
+    return replace_once(
+        build_daemon_conf(varlink_conf),
+        "[report]\nenabled = false",
+        "[report]\nenabled = true",
+    )
 
 
 def build_report_service(service_text: str, binary: str, conf: str, user: str) -> str:
@@ -1602,7 +1613,7 @@ def assert_report_socket(container: str, repo: Path) -> None:
         for poll in range(1, 30):
             listed = parse_json_seq(
                 docker_exec(
-                    container, "varlinkctl", "call", "--more", "-j",
+                    container, "timeout", "10", "varlinkctl", "call", "--more", "-j",
                     REPORT_SOCKET, "io.systemd.Metrics.List", "{}",
                 )
             )
@@ -1621,7 +1632,7 @@ def assert_report_socket(container: str, repo: Path) -> None:
 
         described = parse_json_seq(
             docker_exec(
-                container, "varlinkctl", "call", "--more", "-j",
+                container, "timeout", "10", "varlinkctl", "call", "--more", "-j",
                 REPORT_SOCKET, "io.systemd.Metrics.Describe", "{}",
             )
         )
@@ -1629,13 +1640,52 @@ def assert_report_socket(container: str, repo: Path) -> None:
             raise SystemExit(f"FAIL: Describe families differ: {described}")
         print(f"PASS: io.monitord Describe lists {len(described)} families")
 
+        old_pid = docker_exec(
+            container, "systemctl", "show", "monitord.service", "-p", "MainPID", "--value"
+        ).strip()
+        old_socket = docker_exec(container, "stat", "-c", "%d:%i", REPORT_SOCKET).strip()
+        docker_exec(container, "systemctl", "restart", "monitord.service")
+        new_pid = docker_exec(
+            container, "systemctl", "show", "monitord.service", "-p", "MainPID", "--value"
+        ).strip()
+        socket_state = docker_exec(
+            container, "systemctl", "is-active", "monitord-report.socket"
+        ).strip()
+        if old_pid == new_pid or not new_pid.isdigit() or int(new_pid) == 0:
+            raise SystemExit(f"FAIL: restart did not replace monitord: {old_pid} -> {new_pid}")
+        if socket_state != "active" or old_socket != docker_exec(
+            container, "stat", "-c", "%d:%i", REPORT_SOCKET
+        ).strip():
+            raise SystemExit("FAIL: service restart replaced or stopped the activation socket")
+        # A server answers before its first collection finishes. Wait for the
+        # post-restart sample before expecting timestamp and collector families.
+        restart_deadline = time.monotonic() + 30
+        restart_problems: list[str] = []
+        while time.monotonic() < restart_deadline:
+            listed_after_restart = parse_json_seq(
+                docker_exec(
+                    container, "timeout", "10", "varlinkctl", "call", "--more", "-j",
+                    REPORT_SOCKET, "io.systemd.Metrics.List", "{}",
+                )
+            )
+            restart_problems = check_report_metrics(listed_after_restart)
+            if not restart_problems:
+                break
+            time.sleep(0.2)
+        else:
+            raise SystemExit(
+                "FAIL: report metrics never became healthy after restart: "
+                f"{restart_problems}"
+            )
+        print("PASS: restarting only the service preserves its socket and serves a healthy sample")
+
         report_bin = docker_exec(
             container, "sh", "-c",
             "command -v systemd-report || ls /usr/lib/systemd/systemd-report 2>/dev/null || true",
         ).strip()
         if report_bin:
             output = docker_exec(
-                container, report_bin, "metrics", "io.monitord", "--json=short"
+                container, "timeout", "10", report_bin, "metrics", "io.monitord", "--json=short"
             )
             seen = {m.get("name") for m in parse_json_seq(output)}
             if not REPORT_FAMILIES <= seen:
@@ -1656,6 +1706,146 @@ def assert_report_socket(container: str, repo: Path) -> None:
         raise SystemExit(f"FAIL: {REPORT_SOCKET} left behind after stop")
     docker_exec(container, "test", "-S", METRICS_SOCKET)
     print("PASS: stopping removes io.monitord and leaves the other report sources")
+    assert_report_lifecycle(container)
+
+
+def reset_failed_report_service(container: str) -> None:
+    """Reset failures without touching cleanly stopped units.
+
+    PID 1 may already have unloaded an inactive unit, making reset-failed fail.
+    """
+    state = docker_exec(
+        container, "systemctl", "show", "monitord.service", "-p", "ActiveState", "--value"
+    ).strip()
+    if state == "failed":
+        docker_exec(container, "systemctl", "reset-failed", "monitord.service")
+
+
+def assert_report_lifecycle(container: str) -> None:
+    """Check exit statuses and socket cleanup for activation and self-bind."""
+    step("Asserting report activation errors and orderly self-bind shutdown")
+    write_container_file(
+        container, REPORT_CONF,
+        build_daemon_conf(docker_exec(container, "cat", VARLINK_CONF)),
+    )
+    # The expected failure must remain observable instead of being restarted.
+    dropin_dir = f"{REPORT_UNIT_DIR}/monitord.service.d"
+    docker_exec(container, "mkdir", "-p", dropin_dir)
+    write_container_file(container, f"{dropin_dir}/99-ci.conf", "[Service]\nRestart=no\n")
+    docker_exec(container, "systemctl", "daemon-reload")
+    reset_failed_report_service(container)
+    docker_exec(container, "systemctl", "start", "monitord-report.socket")
+    try:
+        # Type=exec reports a successful exec before application startup
+        # finishes, so check ExecMainCode/Status for the eventual exit.
+        subprocess.run(
+            ["docker", "exec", container, "systemctl", "start", "monitord.service"],
+            capture_output=True, timeout=15,
+        )
+        deadline = time.monotonic() + 15
+        properties: dict[str, str] = {}
+        while time.monotonic() < deadline:
+            properties = dict(
+                line.split("=", 1)
+                for line in docker_exec(
+                    container, "systemctl", "show", "monitord.service",
+                    "-p", "ActiveState", "-p", "ExecMainCode", "-p", "ExecMainStatus",
+                ).splitlines()
+            )
+            if properties.get("ActiveState") not in {"activating", "active", "deactivating"}:
+                break
+        if (
+            properties.get("ExecMainCode") != "1"  # CLD_EXITED, not a signal.
+            or int(properties.get("ExecMainStatus", "0")) == 0
+            or properties.get("ActiveState") != "failed"
+        ):
+            raise SystemExit(
+                f"FAIL: disabled report activation did not exit nonzero: {properties}"
+            )
+        print("PASS: an activated daemon with [report] disabled exits nonzero")
+    finally:
+        docker_exec(container, "systemctl", "stop", "monitord-report.socket", "monitord.service")
+        docker_exec(container, "rm", "-f", f"{dropin_dir}/99-ci.conf")
+        docker_exec(container, "systemctl", "daemon-reload")
+        reset_failed_report_service(container)
+
+    # Root can self-bind in systemd's directory; the shipped unprivileged
+    # service intentionally cannot. A small config makes readiness independent
+    # of unrelated machine and unit collectors.
+    self_bind_conf = "/run/monitord-report-self-bind-ci.conf"
+    write_container_file(
+        container, self_bind_conf,
+        "[monitord]\ndaemon = true\ndaemon_stats_refresh_secs = 60\n"
+        "output_format = json\n[varlink]\nenabled = true\n[report]\nenabled = true\n",
+    )
+    binary = f"{CONTAINER_TARGET_DIR}/release/monitord"
+    pidfile = "/run/monitord-report-self-bind-ci.pid"
+    with tempfile.TemporaryFile() as log:
+        # exec preserves the inner PID and Docker forwards the binary's exit
+        # status. Record that PID so the signal reaches monitord itself.
+        process = subprocess.Popen(
+            [
+                "docker", "exec", container, "sh", "-c",
+                'echo $$ > "$1"; shift; exec "$@"', "monitord-report-test",
+                pidfile, binary, "-c", self_bind_conf,
+            ],
+            stdout=subprocess.PIPE, stderr=log,
+        )
+        pid = None
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                if not selector.select(timeout=20):
+                    raise SystemExit("FAIL: self-binding daemon did not produce a sample in 20s")
+                sample = process.stdout.readline()
+            if not sample:
+                log.seek(0)
+                raise SystemExit(
+                    f"FAIL: self-binding daemon exited before readiness: {log.read()!r}"
+                )
+            json.loads(sample)
+            pid = docker_exec(container, "cat", pidfile).strip()
+            if not pid.isdigit() or int(pid) <= 1:
+                raise SystemExit(f"FAIL: invalid self-binding daemon PID: {pid!r}")
+            docker_exec(
+                container, "timeout", "10", "varlinkctl", "call", "--more", "-j",
+                REPORT_SOCKET, "io.systemd.Metrics.List", "{}",
+            )
+            docker_exec(container, "kill", "-TERM", pid)
+            process.communicate(timeout=10)
+            if process.returncode != 0:
+                log.seek(0)
+                raise SystemExit(f"FAIL: SIGTERM exit was {process.returncode}: {log.read()!r}")
+            docker_exec(container, "test", "!", "-e", REPORT_SOCKET)
+            print("PASS: SIGTERM exits a self-binding daemon with status 0 and removes its socket")
+        finally:
+            if process.poll() is None:
+                if pid is None:
+                    pid = docker_exec(container, "cat", pidfile).strip()
+                if pid.isdigit() and int(pid) > 1:
+                    subprocess.run(
+                        ["docker", "exec", container, "kill", "-KILL", pid],
+                        capture_output=True, timeout=10,
+                    )
+                process.communicate(timeout=10)
+            docker_exec(container, "rm", "-f", pidfile)
+
+    write_container_file(container, REPORT_SOCKET, "keep this file\n")
+    try:
+        failed = subprocess.run(
+            ["docker", "exec", container, binary, "-c", self_bind_conf],
+            capture_output=True, text=True, timeout=10,
+        )
+        if failed.returncode <= 0 or "not a socket" not in failed.stderr:
+            raise SystemExit(
+                f"FAIL: regular-file bind did not fail normally: {failed.returncode}\n"
+                f"{failed.stderr}"
+            )
+        if docker_exec(container, "cat", REPORT_SOCKET) != "keep this file\n":
+            raise SystemExit("FAIL: self-bind replaced the regular file")
+        print("PASS: a regular file at the socket path causes a nonzero exit and is preserved")
+    finally:
+        docker_exec(container, "rm", "-f", REPORT_SOCKET, self_bind_conf)
 
 
 def comparable(stats: Stats) -> Stats:

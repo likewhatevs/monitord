@@ -289,8 +289,9 @@ num_slowest_units = 5
 
 # systemd-report (systemd v260+), two independent switches:
 # - enabled: serve monitord's own health (last run healthy, per-collector
-#   timings and failure counters) on /run/systemd/report/io.monitord. Daemon
-#   mode only. Pairs with monitord-report.socket; see "systemd-report
+#   timings and failure counters) on /run/systemd/report/io.monitord. The
+#   binary serves only in daemon mode; library users start ReportServer.
+#   Enable this and monitord-report.socket together; see "systemd-report
 #   integration" in the README.
 # - collect: pass through metrics from other systemd-report sources:
 #   every io.systemd.Metrics socket in /run/systemd/report/ except
@@ -396,17 +397,55 @@ does not start with the socket's name. monitord gets the socket in one of two wa
   `/run/systemd/report/io.monitord` itself (mode 0666). That needs write
   access to the directory, so in practice root. A socket file someone is
   still serving (another monitord, or `monitord-report.socket`) is never
-  replaced: monitord logs a warning and keeps collecting. A stale one left by
-  a process that died is replaced. monitord never creates the
-  directory: if it is missing, systemd is older than 260, so monitord logs a
-  warning and keeps collecting.
+  replaced: monitord exits with an error. A stale one left by a process that
+  died is replaced. monitord never creates the directory; a missing directory
+  is a startup error. An orderly stop removes only the socket monitord bound,
+  after checking its device and inode. Use one self-binder per path because
+  that check and the removal are separate operations. SIGKILL or a process
+  crash can leave a stale socket for the next start to reclaim.
 
 Do **not** use `RuntimeDirectory=systemd/report` to get write access. systemd
 would delete its own report directory, with the other sources' sockets in it,
 whenever monitord stops.
 
-Library users with their own collection loop (e.g. monitord-exporter) can
-serve the same metrics with `monitord::report::spawn_server`.
+Enable `monitord-report.socket` and `[report] enabled` together. Passing an
+activation fd to a one-shot or reporting-disabled binary is a configuration
+error. Invalid activation, listener setup failure, or a server that stops
+unexpectedly makes the binary exit nonzero, allowing `Restart=on-failure` to
+restart it. The socket unit retains its listener across service restarts;
+queued new connections can be answered by the next process. Connections
+already accepted by the previous process are lost.
+
+SIGTERM and SIGINT stop collection and await report cleanup for up to five
+seconds; timeout exits nonzero, and a normal stop exits zero. The main runtime
+then gets up to two seconds to release blocking collector tasks. A one-shot
+binary with reporting enabled and no activation fd warns and collects once.
+The report server serves at most 64 concurrent clients and eight per user.
+Clients over the total limit can queue in the socket's bounded backlog;
+clients over the per-user limit are closed. Reaching either limit does not
+stop collection. Requests over 64 KiB and requests that pass file descriptors
+are rejected; the metrics methods need neither. If an accept runs out of file
+descriptors while report clients are connected, the server closes those clients
+and retries.
+
+Library users call `unsafe { report::take_activation_fd() }` in `main` before
+starting any other threads, with no other owner of fd 3. In async code, create
+one `Arc<tokio::sync::RwLock<MonitordStats>>`. When `[report] enabled` is true,
+call `ReportServer::start` with that stats value and either
+`ReportListener::Prebound(fd)` or
+`ReportListener::SelfBind(report::REPORT_DIR.into())`. Reject an activation fd
+when serving is disabled. Prebound descriptors become close-on-exec and their
+shared file description becomes nonblocking; monitord leaves their paths and
+permissions unchanged.
+
+Call `stat_collector(config.clone(), Some(stats.clone()), false, connection)`
+for each sample with `[monitord] daemon = false`, passing its returned
+connection into the next sample. Use one stats value per collection stream and
+run samples sequentially. The collector records run counters in that same
+value, so no second stats copy or manual run accounting is needed. Supervise
+`server.wait()` alongside your sampling loop and call `server.shutdown().await`
+when stopping. Dropping a pending start or a server requests cleanup without
+waiting. `stat_collector` itself only collects and never starts a server.
 
 ## Machines support
 
