@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::Instrument;
 use tracing::{debug, error};
 use uzers::get_user_by_uid;
@@ -776,43 +776,23 @@ async fn get_well_known_to_peer_names(
 
     let dbus_names = dbus_proxy.list_names().await?;
 
-    // Each well-known name's owner is an independent D-Bus round-trip. A
-    // semaphore (rather than an unbounded join) caps how many lookups are in
-    // flight at once: a burst of simultaneous D-Bus calls could itself worsen
-    // host-level IPC contention on hosts where per-call latency is already
-    // elevated — the same failure mode units.rs's per-unit loop guards against.
-    let semaphore = Arc::new(Semaphore::new(
-        config.dbus_stats.peer_name_concurrency.max(1) as usize,
-    ));
+    let limit = config.dbus_stats.peer_name_concurrency;
     let parent_span = tracing::Span::current();
-    let mut join_set = tokio::task::JoinSet::new();
-    for owned_busname in dbus_names {
-        if let BusName::WellKnown(_) = &*owned_busname {
-            let dbus_proxy = dbus_proxy.clone();
-            let semaphore = Arc::clone(&semaphore);
-            let parent_span = parent_span.clone();
-            join_set.spawn(async move {
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .expect("semaphore closed unexpectedly");
-                let span = tracing::debug_span!(
-                    parent: &parent_span,
-                    "peer_name_lookup",
-                    name = %owned_busname
-                );
-                async {
-                    let owner = dbus_proxy.get_name_owner((&owned_busname).into()).await?;
-                    Ok::<_, MonitordDbusStatsError>((owner.to_string(), owned_busname.to_string()))
-                }
-                .instrument(span)
-                .await
-            });
-        }
-    }
-
+    let mut pending = dbus_names
+        .into_iter()
+        .filter(|name| matches!(**name, BusName::WellKnown(_)))
+        .map(|name| {
+            let proxy = dbus_proxy.clone();
+            let span = tracing::debug_span!(parent: &parent_span, "peer_name_lookup", %name);
+            async move {
+                let owner = proxy.get_name_owner((&name).into()).await?;
+                Ok::<_, MonitordDbusStatsError>((owner.to_string(), name.to_string()))
+            }
+            .instrument(span)
+        });
+    let mut running = JoinSet::new();
     let mut result = HashMap::new();
-    while let Some(joined) = join_set.join_next().await {
+    while let Some(joined) = crate::join_next_bounded(&mut running, &mut pending, limit).await {
         let (owner, name) = joined??;
         result.insert(owner, name);
     }

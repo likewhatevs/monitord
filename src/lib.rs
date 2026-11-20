@@ -266,6 +266,24 @@ fn daemon_sleep_time_ms(collect_interval_ms: u128, elapsed_runtime_ms: u128) -> 
     collect_interval_ms.saturating_sub(elapsed_runtime_ms)
 }
 
+/// Admit up to `limit` independent D-Bus requests. Keeping the tasks in a
+/// JoinSet isolates panics and aborts outstanding calls when collection ends.
+async fn join_next_bounded<F>(
+    running: &mut tokio::task::JoinSet<F::Output>,
+    pending: &mut impl Iterator<Item = F>,
+    limit: u64,
+) -> Option<Result<F::Output, tokio::task::JoinError>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX).max(1);
+    for task in pending.take(limit.saturating_sub(running.len())) {
+        running.spawn(task);
+    }
+    running.join_next().await
+}
+
 /// Output produced by every spawned collector future after wrapping with timing.
 type TimedCollectorOutput = (String, anyhow::Result<()>, Duration, Duration);
 
@@ -895,6 +913,29 @@ pub async fn stat_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_join_next_bounded_continues_after_panic() {
+        let mut pending = (0..4).map(|unit| async move {
+            assert!(unit >= 2, "unit failed");
+            unit
+        });
+        let mut running = tokio::task::JoinSet::new();
+        let mut completed = Vec::new();
+        for left in [2, 1, 0, 0] {
+            let result = join_next_bounded(&mut running, &mut pending, 2)
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), left);
+            match result {
+                Ok(unit) => completed.push(unit),
+                Err(error) => assert!(error.is_panic()),
+            }
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, [2, 3]);
+        assert!(running.is_empty());
+    }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn socket_fd_count(socket: &impl std::os::fd::AsRawFd) -> usize {

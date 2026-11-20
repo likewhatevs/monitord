@@ -16,7 +16,6 @@ use std::time::UNIX_EPOCH;
 use struct_field_names_as_array::FieldNamesAsArray;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::error;
@@ -938,35 +937,19 @@ pub async fn parse_unit_state(
         parse_unit(&mut stats, unit);
     }
 
-    // Bounded-concurrency D-Bus work per unit. A semaphore (rather than an
-    // unbounded join) caps how many units are in flight at once: a burst of
-    // simultaneous D-Bus calls could itself worsen host-level IPC contention
-    // on hosts where per-call latency is already elevated, which is exactly
-    // the failure mode this loop exists to avoid.
-    let semaphore = Arc::new(Semaphore::new(
-        config.units.per_unit_concurrency.max(1) as usize
-    ));
-    // Captured once, outside the loop: `JoinSet::spawn` runs each unit on a new
-    // task, and tracing spans do not cross task boundaries automatically. Without
-    // attaching this as the explicit parent below, every `unit_collect` span
-    // becomes its own unrelated root trace instead of a child of this collector.
+    // Keep concurrent D-Bus calls bounded on busy hosts.
+    let limit = config.units.per_unit_concurrency;
     let parent_span = tracing::Span::current();
     // Host-wide memory numbers for the `memory_available` fold, read once
     // per collection cycle and shared by every unit (rather than once per
     // service inside `parse_service`).
     let host_memory = crate::cgroup::read_host_memory().await;
-    let mut join_set: JoinSet<PerUnitOutcome> = JoinSet::new();
-    for unit in listed_units {
-        let semaphore = Arc::clone(&semaphore);
+    let mut pending = listed_units.into_iter().map(|unit| {
         let config = Arc::clone(config);
         let connection = connection.clone();
         let parent_span = parent_span.clone();
         let fs_root = fs_root.to_string();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .expect("semaphore closed unexpectedly");
+        async move {
             let unit_collect_start = Instant::now();
             let span =
                 tracing::debug_span!(parent: &parent_span, "unit_collect", unit = %unit.name);
@@ -1032,11 +1015,11 @@ pub async fn parse_unit_state(
 
             outcome.duration_ms = unit_collect_start.elapsed().as_secs_f64() * 1000.0;
             outcome
-        });
-    }
-
+        }
+    });
+    let mut running = JoinSet::new();
     let mut slowest_units: Vec<(String, f64)> = Vec::new();
-    while let Some(res) = join_set.join_next().await {
+    while let Some(res) = crate::join_next_bounded(&mut running, &mut pending, limit).await {
         let outcome = match res {
             Ok(outcome) => outcome,
             Err(err) => {
