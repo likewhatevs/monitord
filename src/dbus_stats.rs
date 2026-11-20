@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use futures_util::{stream, StreamExt};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -92,16 +94,54 @@ impl DBusBrokerPeerAccounting {
             .process_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing process_id"))?;
 
-        let path = format!("/proc/{}/cgroup", pid);
-        let content = fs::read_to_string(&path)?;
-
-        // ex: 0::/system.slice/metalos.classic.metald.service
-        let cgroup = content.strip_prefix("0::").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "unexpected cgroup format")
-        })?;
-
-        Ok(cgroup.trim().trim_matches('/').replace('/', "-"))
+        read_cgroup_name(pid)
     }
+
+    async fn machine_cgroup_name(&self, proxy: &DBusProxy<'_>) -> anyhow::Result<String> {
+        // A unique bus name identifies one connection for the lifetime of the bus.
+        let name = zbus::names::UniqueName::try_from(self.id.as_str())?;
+        let credentials = proxy.get_connection_credentials(name.into()).await?;
+        let fd = credentials
+            .process_fd()
+            .ok_or_else(|| anyhow::anyhow!("missing ProcessFD"))?;
+        Ok(cgroup_from_pidfd(fd.as_fd())?)
+    }
+}
+
+fn read_cgroup_name(pid: u32) -> io::Result<String> {
+    let content = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    // ex: 0::/system.slice/metalos.classic.metald.service
+    let cgroup = content
+        .strip_prefix("0::")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unexpected cgroup format"))?;
+    Ok(cgroup.trim().trim_matches('/').replace('/', "-"))
+}
+
+fn cgroup_from_pidfd(fd: BorrowedFd<'_>) -> io::Result<String> {
+    // fdinfo reports the PID in the namespace of this procfs mount.
+    let fdinfo = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
+    let read_pid = || {
+        fs::read_to_string(&fdinfo)?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Pid:")?
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&pid| pid > 0)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer process unavailable"))
+    };
+    let pid = read_pid()?;
+    let name = read_cgroup_name(pid)?;
+    // If the peer exited, its numeric PID could have been reused during the read.
+    if read_pid()? != pid {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "peer process changed",
+        ));
+    }
+    Ok(name)
 }
 
 /// Aggregated D-Bus resource accounting grouped by cgroup.
@@ -514,10 +554,9 @@ async fn parse_peer_accounting(
     connection: &zbus::Connection,
     config: &crate::config::Config,
     owned_value: Option<&OwnedVariant>,
+    collect_cgroups: bool,
 ) -> Result<Option<Vec<DBusBrokerPeerAccounting>>, MonitordDbusStatsError> {
-    // need to keep collecting peer stats when cgroup_stats=true
-    // since cgroup_stats is a derivative of peer stats
-    if !config.dbus_stats.peer_stats && !config.dbus_stats.cgroup_stats {
+    if !config.dbus_stats.peer_stats && !collect_cgroups {
         return Ok(None);
     }
 
@@ -574,45 +613,57 @@ fn filter_and_collect_peer_accounting(
     Some(result)
 }
 
-fn filter_and_collect_cgroup_accounting(
+async fn filter_and_collect_cgroup_accounting(
     config: &crate::config::Config,
-    peers: Option<&Vec<DBusBrokerPeerAccounting>>,
+    peers: &[DBusBrokerPeerAccounting],
+    machine_bus: Option<&zbus::Connection>,
 ) -> Option<HashMap<String, DBusBrokerCGroupAccounting>> {
-    // reject collecting cgroup stats when told so
-    if !config.dbus_stats.cgroup_stats {
-        return None;
-    }
-
-    let mut result: HashMap<String, DBusBrokerCGroupAccounting> = HashMap::new();
-
-    for peer in peers?.iter() {
-        let cgroup_name = match peer.get_cgroup_name() {
-            Ok(name) => name,
-            Err(err) => {
-                error!("Failed to get cgroup name for peer {}: {}", peer.id, err);
-                continue;
-            }
-        };
-
-        if config.dbus_stats.cgroup_blocklist.contains(&cgroup_name) {
-            continue;
-        }
-
-        if !config.dbus_stats.cgroup_allowlist.is_empty()
-            && !config.dbus_stats.cgroup_allowlist.contains(&cgroup_name)
+    let mut result = HashMap::new();
+    let mut add_peer = |name: String, peer: &DBusBrokerPeerAccounting| {
+        if config.dbus_stats.cgroup_blocklist.contains(&name)
+            || (!config.dbus_stats.cgroup_allowlist.is_empty()
+                && !config.dbus_stats.cgroup_allowlist.contains(&name))
         {
-            continue;
+            return;
         }
+        result
+            .entry(name.clone())
+            .or_insert_with(|| DBusBrokerCGroupAccounting {
+                name,
+                ..Default::default()
+            })
+            .combine_with_peer(peer);
+    };
 
-        let entry =
-            result
-                .entry(cgroup_name.clone())
-                .or_insert_with(|| DBusBrokerCGroupAccounting {
-                    name: cgroup_name,
-                    ..Default::default()
-                });
-
-        entry.combine_with_peer(peer);
+    if let Some(bus) = machine_bus {
+        let proxy = DBusProxy::builder(bus)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .ok()?;
+        let limit = usize::try_from(config.dbus_stats.peer_name_concurrency)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut lookups = stream::iter(0..peers.len())
+            .map(|i| {
+                let peer = &peers[i];
+                let proxy = &proxy;
+                async move { (peer, peer.machine_cgroup_name(proxy).await) }
+            })
+            .buffer_unordered(limit);
+        while let Some((peer, name)) = lookups.next().await {
+            match name {
+                Ok(name) => add_peer(name, peer),
+                Err(err) => debug!("No machine cgroup for peer {}: {}", peer.id, err),
+            }
+        }
+    } else {
+        for peer in peers {
+            match peer.get_cgroup_name() {
+                Ok(name) => add_peer(name, peer),
+                Err(err) => error!("Failed to get cgroup name for peer {}: {}", peer.id, err),
+            }
+        }
     }
 
     Some(result)
@@ -720,14 +771,14 @@ async fn get_well_known_to_peer_names(
 async fn parse_dbus_stats_inner(
     config: &crate::config::Config,
     connection: &zbus::Connection,
-    collect_stale_fds: bool,
+    host_bus: bool,
 ) -> Result<DBusStats, MonitordDbusStatsError> {
     let stats_proxy = StatsProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;
 
-    let stale_fds_task = if collect_stale_fds && config.dbus_stats.stale_fd_stats {
+    let stale_fds_task = if host_bus && config.dbus_stats.stale_fd_stats {
         Some(tokio::task::spawn_blocking(
             collect_system_dbus_broker_stale_fds,
         ))
@@ -736,12 +787,23 @@ async fn parse_dbus_stats_inner(
     };
 
     let stats = stats_proxy.get_stats().await?;
+    let collect_cgroups =
+        config.dbus_stats.cgroup_stats && (host_bus || config.dbus_stats.machine_cgroup_stats);
     let peers = parse_peer_accounting(
         connection,
         config,
         stats.rest().get("org.bus1.DBus.Debug.Stats.PeerAccounting"),
+        collect_cgroups,
     )
     .await?;
+
+    let cgroups = match peers.as_deref() {
+        Some(peers) if collect_cgroups => {
+            filter_and_collect_cgroup_accounting(config, peers, (!host_bus).then_some(connection))
+                .await
+        }
+        _ => None,
+    };
 
     let stale_fds = match stale_fds_task {
         Some(task) => match task.await {
@@ -781,7 +843,7 @@ async fn parse_dbus_stats_inner(
 
         // attempt to parse dbus-broker specific stats
         dbus_broker_peer_accounting: filter_and_collect_peer_accounting(config, peers.as_ref()),
-        dbus_broker_cgroup_accounting: filter_and_collect_cgroup_accounting(config, peers.as_ref()),
+        dbus_broker_cgroup_accounting: cgroups,
         dbus_broker_user_accounting,
     };
 
@@ -807,8 +869,7 @@ pub async fn update_dbus_stats(
 
 /// Async wrapper for nested machine/container buses.
 ///
-/// Stale pidfd accounting is read from host procfs and currently cannot be
-/// attributed to nested machine D-Bus brokers, so machine stats skip it.
+/// Resolve machine peer cgroups using process descriptors supplied by the broker.
 pub async fn update_machine_dbus_stats(
     config: Arc<crate::config::Config>,
     connection: zbus::Connection,
@@ -821,9 +882,9 @@ async fn update_dbus_stats_inner(
     config: Arc<crate::config::Config>,
     connection: zbus::Connection,
     locked_machine_stats: Arc<RwLock<MachineStats>>,
-    collect_stale_fds: bool,
+    host_bus: bool,
 ) -> anyhow::Result<()> {
-    match parse_dbus_stats_inner(&config, &connection, collect_stale_fds).await {
+    match parse_dbus_stats_inner(&config, &connection, host_bus).await {
         Ok(dbus_stats) => {
             let mut machine_stats = locked_machine_stats.write().await;
             machine_stats.dbus_stats = Some(dbus_stats)
@@ -926,6 +987,25 @@ mod tests {
         assert_eq!(
             collect_system_dbus_broker_stale_fds_from_proc(proc_root).expect("collect stale fds"),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn test_cgroup_from_pidfd_rejects_reaped_peer() {
+        use rustix::process::{pidfd_open, Pid, PidfdFlags};
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cat").stdin(Stdio::piped()).spawn().unwrap();
+        let pid = Pid::from_child(&child);
+        let fd = pidfd_open(pid, PidfdFlags::empty()).unwrap();
+        assert_eq!(
+            cgroup_from_pidfd(fd.as_fd()).unwrap(),
+            read_cgroup_name(child.id()).unwrap()
+        );
+        child.wait().unwrap();
+        assert_eq!(
+            cgroup_from_pidfd(fd.as_fd()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
     }
 
