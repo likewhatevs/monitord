@@ -3,7 +3,6 @@
 //! Collects boot blame metrics showing the slowest units at boot.
 //! Similar to `systemd-analyze blame` but stores N slowest units.
 
-use std::array::TryFromSliceError;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::num::TryFromIntError;
@@ -39,8 +38,6 @@ enum BootCacheError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("boot cache integer conversion error: {0}")]
     IntConversion(#[from] TryFromIntError),
-    #[error("boot cache slice conversion error: {0}")]
-    SliceConversion(#[from] TryFromSliceError),
 }
 
 fn cache_file_path(cache_dir: &Path, boot_id: &str) -> PathBuf {
@@ -56,7 +53,10 @@ async fn get_boot_id() -> BootCacheResult<String> {
     Ok(boot_id)
 }
 
-fn encode_boot_blame_stats(stats: &BootBlameStats) -> BootCacheResult<Vec<u8>> {
+fn encode_cached_boot_blame(
+    stats: &BootBlameStats,
+    transport: crate::CollectorTransport,
+) -> BootCacheResult<Vec<u8>> {
     let mut out = Vec::new();
     let entry_count = u32::try_from(stats.len())?;
     out.extend_from_slice(&entry_count.to_le_bytes());
@@ -69,6 +69,7 @@ fn encode_boot_blame_stats(stats: &BootBlameStats) -> BootCacheResult<Vec<u8>> {
         out.extend_from_slice(&activation_time.to_le_bytes());
     }
 
+    out.push(transport as u8);
     Ok(out)
 }
 
@@ -83,79 +84,33 @@ struct DecodedBootBlame {
     transport: Option<crate::CollectorTransport>,
 }
 
-fn decode_boot_blame_stats(content: &[u8]) -> BootCacheResult<BootBlameStats> {
-    const U32_BYTES: usize = std::mem::size_of::<u32>();
-    const F64_BYTES: usize = std::mem::size_of::<f64>();
-    fn read_u32(bytes: &[u8], offset: &mut usize) -> BootCacheResult<u32> {
-        if *offset + std::mem::size_of::<u32>() > bytes.len() {
-            return Err(BootCacheError::InvalidPayload("unexpected end of payload"));
-        }
-        let value =
-            u32::from_le_bytes(bytes[*offset..*offset + std::mem::size_of::<u32>()].try_into()?);
-        *offset += std::mem::size_of::<u32>();
-        Ok(value)
+fn decode_cached_boot_blame(mut content: &[u8]) -> BootCacheResult<DecodedBootBlame> {
+    fn read_number<const N: usize>(content: &mut &[u8]) -> BootCacheResult<[u8; N]> {
+        let (number, rest) = content
+            .split_first_chunk()
+            .ok_or(BootCacheError::InvalidPayload("unexpected end of payload"))?;
+        *content = rest;
+        Ok(*number)
     }
 
-    if content.len() < U32_BYTES {
-        return Err(BootCacheError::InvalidPayload("payload too small"));
-    }
-
-    let mut offset = 0usize;
-    let entry_count = read_u32(content, &mut offset)? as usize;
-    let mut stats = BootBlameStats::with_capacity(entry_count);
-
+    let entry_count = u32::from_le_bytes(read_number(&mut content)?);
+    let mut stats = BootBlameStats::new();
     for _ in 0..entry_count {
-        let name_len = read_u32(content, &mut offset)? as usize;
-        if offset + name_len + F64_BYTES > content.len() {
-            return Err(BootCacheError::InvalidPayload("invalid payload size"));
-        }
-        let unit_name = String::from_utf8(content[offset..offset + name_len].to_vec())?;
-        offset += name_len;
-        let activation_time = f64::from_le_bytes(content[offset..offset + F64_BYTES].try_into()?);
-        offset += F64_BYTES;
-        stats.insert(unit_name, activation_time);
+        let name_len = u32::from_le_bytes(read_number(&mut content)?) as usize;
+        let name = content
+            .split_off(..name_len)
+            .ok_or(BootCacheError::InvalidPayload("invalid unit name length"))?;
+        let activation_time = f64::from_le_bytes(read_number(&mut content)?);
+        stats.insert(String::from_utf8(name.to_vec())?, activation_time);
     }
 
-    if offset != content.len() {
-        return Err(BootCacheError::InvalidPayload("trailing bytes in payload"));
-    }
-
-    Ok(stats)
-}
-
-fn encode_cached_boot_blame(
-    stats: &BootBlameStats,
-    transport: crate::CollectorTransport,
-) -> BootCacheResult<Vec<u8>> {
-    let mut out = encode_boot_blame_stats(stats)?;
-    out.push(transport as u8);
-    Ok(out)
-}
-
-fn decode_cached_boot_blame(content: &[u8]) -> BootCacheResult<DecodedBootBlame> {
-    // Current files carry one trailing transport byte after the entries;
-    // legacy files end right after the last entry. A last byte of 0/1 whose
-    // removal leaves a well-formed entry payload is the new format —
-    // anything else decodes as legacy (transport unknown).
-    if let Some((payload, [marker])) = content.split_at_checked(content.len().saturating_sub(1)) {
-        if *marker <= 1 {
-            if let Ok(stats) = decode_boot_blame_stats(payload) {
-                let transport = if *marker == 1 {
-                    crate::CollectorTransport::Varlink
-                } else {
-                    crate::CollectorTransport::Dbus
-                };
-                return Ok(DecodedBootBlame {
-                    stats,
-                    transport: Some(transport),
-                });
-            }
-        }
-    }
-    Ok(DecodedBootBlame {
-        stats: decode_boot_blame_stats(content)?,
-        transport: None,
-    })
+    let transport = match content {
+        [] => None,
+        [0] => Some(crate::CollectorTransport::Dbus),
+        [1] => Some(crate::CollectorTransport::Varlink),
+        _ => return Err(BootCacheError::InvalidPayload("trailing bytes in payload")),
+    };
+    Ok(DecodedBootBlame { stats, transport })
 }
 
 async fn read_cached_boot_blame_from_dir(
@@ -276,7 +231,7 @@ pub(crate) async fn update_boot_blame_stats(
     dbus: crate::DbusCell,
     dbus_timeout: u64,
     machine_stats: Arc<RwLock<MachineStats>>,
-    no_fallback: bool,
+    metrics: Option<crate::varlink_units::SharedMetrics>,
 ) -> Result<()> {
     debug!("Starting boot blame stats collection");
 
@@ -284,8 +239,7 @@ pub(crate) async fn update_boot_blame_stats(
     if config.boot_blame.cache_enabled {
         // In-memory hit: the collecting run already recorded which transport
         // produced these stats, so the gauge is intact — keep it.
-        let cached_stats = machine_stats.read().await.boot_blame.clone();
-        if cached_stats.is_some() {
+        if machine_stats.read().await.boot_blame.is_some() {
             debug!("Using in-memory cached boot blame stats");
             return Ok(());
         }
@@ -322,7 +276,7 @@ pub(crate) async fn update_boot_blame_stats(
                                     &config,
                                     &dbus,
                                     dbus_timeout,
-                                    no_fallback,
+                                    metrics,
                                     machine_stats,
                                     maybe_boot_id,
                                 )
@@ -353,7 +307,7 @@ pub(crate) async fn update_boot_blame_stats(
         &config,
         &dbus,
         dbus_timeout,
-        no_fallback,
+        metrics,
         machine_stats,
         maybe_boot_id,
     )
@@ -367,24 +321,23 @@ async fn collect_and_cache(
     config: &Arc<Config>,
     dbus: &crate::DbusCell,
     dbus_timeout: u64,
-    no_fallback: bool,
+    metrics: Option<crate::varlink_units::SharedMetrics>,
     machine_stats: Arc<RwLock<MachineStats>>,
     maybe_boot_id: Option<String>,
 ) -> Result<()> {
-    let use_varlink = config.use_varlink(&[config.boot_blame.varlink]);
-    let (boot_blame_stats, transport) = if use_varlink {
-        match crate::varlink_boot::get_boot_blame_stats(
-            crate::varlink_boot::METRICS_SOCKET_PATH,
-            &config.boot_blame,
-        )
-        .await
-        {
+    let (boot_blame_stats, transport) = if let Some(metrics) = metrics {
+        let collected = crate::varlink_units::await_metrics(metrics)
+            .await
+            .and_then(|metrics| {
+                crate::varlink_boot::parse_boot_blame(&metrics, &config.boot_blame)
+            });
+        match collected {
             Ok(stats) => (stats, crate::CollectorTransport::Varlink),
             Err(err) => {
                 // Plain `?`: NoFallbackError already renders the full
                 // explanation via Display; `{:?}` would dump the struct.
                 crate::varlink_fallback::report_varlink_failure(
-                    no_fallback,
+                    config.varlink.no_fallback,
                     "boot blame",
                     "D-Bus",
                     err,
@@ -441,50 +394,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_boot_blame_cache_encode_decode_roundtrip() {
-        let mut stats = BootBlameStats::new();
-        stats.insert("foo.service".to_string(), 12.3);
-        stats.insert("bar.service".to_string(), 45.6);
-
-        let encoded = encode_boot_blame_stats(&stats).expect("encode should succeed");
-        let decoded = decode_boot_blame_stats(&encoded).expect("decode should succeed");
-        assert_eq!(stats, decoded);
-    }
-
-    #[test]
     fn test_boot_blame_cache_decode_invalid_payload() {
-        let invalid_payload = vec![0, 1, 2];
-        assert!(decode_boot_blame_stats(&invalid_payload).is_err());
-    }
-
-    #[test]
-    fn test_cached_boot_blame_roundtrips_transport() {
-        // The disk cache stamps which transport produced the entry so hits
-        // replay an honest gauge instead of going absent.
-        let mut stats = BootBlameStats::new();
-        stats.insert("foo.service".to_string(), 12.3);
-        for transport in [
-            crate::CollectorTransport::Varlink,
-            crate::CollectorTransport::Dbus,
-        ] {
-            let encoded = encode_cached_boot_blame(&stats, transport).expect("encode");
-            let decoded = decode_cached_boot_blame(&encoded).expect("decode");
-            assert_eq!(stats, decoded.stats);
-            assert_eq!(Some(transport), decoded.transport);
+        // A truncated count, an impossible count and an unknown transport.
+        for invalid in [&[0, 1, 2][..], &[255; 4], &[0, 0, 0, 0, 2]] {
+            assert!(decode_cached_boot_blame(invalid).is_err());
         }
     }
 
     #[test]
-    fn test_legacy_boot_blame_cache_decodes_without_transport() {
-        // Pre-gauge files carry no transport byte: they decode with
-        // transport None, and the caller re-collects rather than guessing.
-        let mut stats = BootBlameStats::new();
-        stats.insert("foo.service".to_string(), 12.3);
-        stats.insert("bar.service".to_string(), 45.6);
-        let encoded = encode_boot_blame_stats(&stats).expect("encode should succeed");
-        let decoded = decode_cached_boot_blame(&encoded).expect("decode should succeed");
-        assert_eq!(stats, decoded.stats);
-        assert_eq!(None, decoded.transport);
+    fn test_boot_blame_cache_formats() {
+        // One entry in the original on-disk format, without a transport byte.
+        let legacy = b"\x01\0\0\0\x0b\0\0\0foo.service\0\0\0\0\0\0\xf4\x3f";
+        let stats = BootBlameStats::from([("foo.service".to_string(), 1.25)]);
+        let decoded = decode_cached_boot_blame(legacy).expect("decode legacy cache");
+        assert_eq!(decoded.stats, stats);
+        assert_eq!(decoded.transport, None);
+
+        for (marker, transport) in [
+            (0, crate::CollectorTransport::Dbus),
+            (1, crate::CollectorTransport::Varlink),
+        ] {
+            let mut tagged = legacy.to_vec();
+            tagged.push(marker);
+            assert_eq!(encode_cached_boot_blame(&stats, transport).unwrap(), tagged);
+            let decoded = decode_cached_boot_blame(&tagged).expect("decode tagged cache");
+            assert_eq!(decoded.stats, stats);
+            assert_eq!(decoded.transport, Some(transport));
+        }
     }
 
     #[tokio::test]
@@ -493,6 +429,7 @@ mod tests {
         let boot_id = "00000000-0000-0000-0000-000000000001";
         let mut stats = BootBlameStats::new();
         stats.insert("foo.service".to_string(), 1.25);
+        stats.insert("bar.service".to_string(), 45.6);
 
         write_cached_boot_blame_to_dir(
             temp_dir.path(),
