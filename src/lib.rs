@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -234,19 +235,25 @@ pub fn print_stats(
     stats: &MonitordStats,
 ) {
     match output_format {
-        config::MonitordOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string(&stats).expect("Invalid JSON serialization")
-        ),
-        config::MonitordOutputFormat::JsonFlat => println!(
-            "{}",
-            json::flatten(stats, key_prefix).expect("Invalid JSON serialization")
-        ),
-        config::MonitordOutputFormat::JsonPretty => println!(
-            "{}",
-            serde_json::to_string_pretty(&stats).expect("Invalid JSON serialization")
-        ),
+        config::MonitordOutputFormat::Json => print_json(stats, false),
+        config::MonitordOutputFormat::JsonFlat => {
+            print_json(&json::flatten_stats(stats, key_prefix), true)
+        }
+        config::MonitordOutputFormat::JsonPretty => print_json(stats, true),
     }
+}
+
+fn print_json(value: &impl serde::Serialize, pretty: bool) {
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    if pretty {
+        serde_json::to_writer_pretty(&mut out, value)
+    } else {
+        serde_json::to_writer(&mut out, value)
+    }
+    .expect("Failed to write JSON");
+    writeln!(out)
+        .and_then(|_| out.flush())
+        .expect("Failed to write JSON");
 }
 
 fn set_stat_collection_run_time(stats: &mut MonitordStats, elapsed_runtime: Duration) {
