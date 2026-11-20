@@ -422,6 +422,13 @@ impl TryFrom<Ini> for Config {
 
     fn try_from(ini_config: Ini) -> Result<Self, MonitordConfigError> {
         let mut config = Config::default();
+        let config_map = ini_config.get_map_ref();
+        let section_keys = |section: &str| {
+            config_map
+                .get(section)
+                .map(|entries| entries.keys().cloned().collect())
+                .unwrap_or_default()
+        };
 
         // [monitord] section
         if let Some(dbus_address) = ini_config.get("monitord", "dbus_address") {
@@ -465,10 +472,7 @@ impl TryFrom<Ini> for Config {
         config.pid1.enabled = read_config_bool(&ini_config, "pid1", "enabled")?;
 
         // [services] section
-        let config_map = ini_config.get_map().unwrap_or(IndexMap::from([]));
-        if let Some(services) = config_map.get("services") {
-            config.services = services.keys().map(|s| s.to_string()).collect();
-        }
+        config.services = section_keys("services");
 
         // [system-state] section
         config.system_state.enabled = read_config_bool(&ini_config, "system-state", "enabled")?;
@@ -478,12 +482,8 @@ impl TryFrom<Ini> for Config {
 
         // [timers] section
         config.timers.enabled = read_config_bool(&ini_config, "timers", "enabled")?;
-        if let Some(timers_allowlist) = config_map.get("timers.allowlist") {
-            config.timers.allowlist = timers_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(timers_blocklist) = config_map.get("timers.blocklist") {
-            config.timers.blocklist = timers_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.timers.allowlist = section_keys("timers.allowlist");
+        config.timers.blocklist = section_keys("timers.blocklist");
 
         // [units] section
         config.units.enabled = read_config_bool(&ini_config, "units", "enabled")?;
@@ -507,18 +507,8 @@ impl TryFrom<Ini> for Config {
             }
         }
         config.units.state_stats = read_config_bool(&ini_config, "units", "state_stats")?;
-        if let Some(state_stats_allowlist) = config_map.get("units.state_stats.allowlist") {
-            config.units.state_stats_allowlist = state_stats_allowlist
-                .keys()
-                .map(|s| s.to_string())
-                .collect();
-        }
-        if let Some(state_stats_blocklist) = config_map.get("units.state_stats.blocklist") {
-            config.units.state_stats_blocklist = state_stats_blocklist
-                .keys()
-                .map(|s| s.to_string())
-                .collect();
-        }
+        config.units.state_stats_allowlist = section_keys("units.state_stats.allowlist");
+        config.units.state_stats_blocklist = section_keys("units.state_stats.blocklist");
         if let Some(entries) = config_map.get("units.state_stats.boot_grace") {
             for (label, value) in entries {
                 let invalid = || MonitordConfigError::InvalidValue {
@@ -569,12 +559,8 @@ impl TryFrom<Ini> for Config {
         if let Some(varlink) = read_config_optional_bool(&ini_config, "machines", "varlink")? {
             config.machines.varlink = varlink;
         }
-        if let Some(machines_allowlist) = config_map.get("machines.allowlist") {
-            config.machines.allowlist = machines_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(machines_blocklist) = config_map.get("machines.blocklist") {
-            config.machines.blocklist = machines_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.machines.allowlist = section_keys("machines.allowlist");
+        config.machines.blocklist = section_keys("machines.blocklist");
 
         // [dbus] section
         config.dbus_stats.enabled = read_config_bool(&ini_config, "dbus", "enabled")?;
@@ -585,40 +571,22 @@ impl TryFrom<Ini> for Config {
         }
 
         config.dbus_stats.user_stats = read_config_bool(&ini_config, "dbus", "user_stats")?;
-        if let Some(user_allowlist) = config_map.get("dbus.user.allowlist") {
-            config.dbus_stats.user_allowlist =
-                user_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(user_blocklist) = config_map.get("dbus.user.blocklist") {
-            config.dbus_stats.user_blocklist =
-                user_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.dbus_stats.user_allowlist = section_keys("dbus.user.allowlist");
+        config.dbus_stats.user_blocklist = section_keys("dbus.user.blocklist");
 
         config.dbus_stats.peer_stats = read_config_bool(&ini_config, "dbus", "peer_stats")?;
         config.dbus_stats.peer_well_known_names_only =
             read_config_bool(&ini_config, "dbus", "peer_well_known_names_only")?;
-        if let Some(peer_allowlist) = config_map.get("dbus.peer.allowlist") {
-            config.dbus_stats.peer_allowlist =
-                peer_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(peer_blocklist) = config_map.get("dbus.peer.blocklist") {
-            config.dbus_stats.peer_blocklist =
-                peer_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.dbus_stats.peer_allowlist = section_keys("dbus.peer.allowlist");
+        config.dbus_stats.peer_blocklist = section_keys("dbus.peer.blocklist");
         if let Ok(Some(peer_name_concurrency)) = ini_config.getuint("dbus", "peer_name_concurrency")
         {
             config.dbus_stats.peer_name_concurrency = peer_name_concurrency;
         }
 
         config.dbus_stats.cgroup_stats = read_config_bool(&ini_config, "dbus", "cgroup_stats")?;
-        if let Some(cgroup_allowlist) = config_map.get("dbus.cgroup.allowlist") {
-            config.dbus_stats.cgroup_allowlist =
-                cgroup_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(cgroup_blocklist) = config_map.get("dbus.cgroup.blocklist") {
-            config.dbus_stats.cgroup_blocklist =
-                cgroup_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.dbus_stats.cgroup_allowlist = section_keys("dbus.cgroup.allowlist");
+        config.dbus_stats.cgroup_blocklist = section_keys("dbus.cgroup.blocklist");
 
         // [boot] section
         config.boot_blame.enabled = read_config_bool(&ini_config, "boot", "enabled")?;
@@ -636,24 +604,16 @@ impl TryFrom<Ini> for Config {
         if let Ok(Some(num_slowest_units)) = ini_config.getuint("boot", "num_slowest_units") {
             config.boot_blame.num_slowest_units = num_slowest_units;
         }
-        if let Some(boot_allowlist) = config_map.get("boot.allowlist") {
-            config.boot_blame.allowlist = boot_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(boot_blocklist) = config_map.get("boot.blocklist") {
-            config.boot_blame.blocklist = boot_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.boot_blame.allowlist = section_keys("boot.allowlist");
+        config.boot_blame.blocklist = section_keys("boot.blocklist");
 
         // [verify] section
         config.verify.enabled = read_config_bool(&ini_config, "verify", "enabled")?;
         if let Some(varlink) = read_config_optional_bool(&ini_config, "verify", "varlink")? {
             config.verify.varlink = varlink;
         }
-        if let Some(verify_allowlist) = config_map.get("verify.allowlist") {
-            config.verify.allowlist = verify_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(verify_blocklist) = config_map.get("verify.blocklist") {
-            config.verify.blocklist = verify_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.verify.allowlist = section_keys("verify.allowlist");
+        config.verify.blocklist = section_keys("verify.blocklist");
 
         // [varlink] section
         config.varlink.enabled = read_config_bool(&ini_config, "varlink", "enabled")?;
@@ -678,16 +638,9 @@ impl TryFrom<Ini> for Config {
         if let Some(collect) = read_config_optional_bool(&ini_config, "report", "collect")? {
             config.report.collect = collect;
         }
-        if let Some(allowlist) = config_map.get("report.sources.allowlist") {
-            config.report.allowlist = allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(blocklist) = config_map.get("report.sources.blocklist") {
-            config.report.blocklist = blocklist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(metric_blocklist) = config_map.get("report.metrics.blocklist") {
-            config.report.metric_blocklist =
-                metric_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.report.allowlist = section_keys("report.sources.allowlist");
+        config.report.blocklist = section_keys("report.sources.blocklist");
+        config.report.metric_blocklist = section_keys("report.metrics.blocklist");
         for (section, format) in [
             ("report.commands", ReportCommandFormat::Records),
             ("report.commands.number", ReportCommandFormat::Number),
@@ -719,7 +672,7 @@ impl TryFrom<Ini> for Config {
             }
         }
 
-        for entry in unknown_config_entries(&config_map) {
+        for entry in unknown_config_entries(config_map) {
             warn!("Ignoring {entry}; check for a typo'd key or section");
         }
 
@@ -1054,15 +1007,7 @@ output_format = json-flat
 
     #[test]
     fn test_minimal_config() {
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(MINIMAL_CONFIG.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(MINIMAL_CONFIG);
 
         let expected_config: Config = ini_config.try_into().expect("Failed to parse config");
         // See our one setting is not the default 'json' enum value
@@ -1210,15 +1155,7 @@ output_format = json
 [units]
 ignore_inactive_oneshot_services = false
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(units_override_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(units_override_config);
 
         let parsed_config: Config = ini_config.try_into().expect("Failed to parse config");
         assert!(!parsed_config.units.ignore_inactive_oneshot_services);
@@ -1235,15 +1172,7 @@ per_unit_concurrency = 32
 slowest_units_count = 0
 service_details_cache_max_age_secs = 0
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(units_override_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(units_override_config);
 
         let parsed_config: Config = ini_config.try_into().expect("Failed to parse config");
         assert_eq!(parsed_config.units.per_unit_concurrency, 32);
@@ -1289,15 +1218,7 @@ foo.service
 [bogus]
 key = value
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(typo_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(typo_config);
 
         let unknown = unknown_config_entries(&ini_config.get_map().expect("config map"));
         assert!(unknown.contains(&"unknown key 'varlnik' in [units]".to_string()));
@@ -1318,10 +1239,7 @@ output_format = json
 enabled = true
 no_fallback = true
 "###;
-        let mut f = NamedTempFile::new().expect("tempfile");
-        f.write_all(on.as_bytes()).expect("write");
-        let mut ini = Ini::new();
-        ini.load(f.path()).expect("load");
+        let ini = load_ini(on);
         let parsed: Config = ini.try_into().expect("parse");
         assert!(parsed.varlink.no_fallback);
 
@@ -1332,10 +1250,7 @@ output_format = json
 [varlink]
 enabled = true
 "###;
-        let mut f = NamedTempFile::new().expect("tempfile");
-        f.write_all(off.as_bytes()).expect("write");
-        let mut ini = Ini::new();
-        ini.load(f.path()).expect("load");
+        let ini = load_ini(off);
         let parsed: Config = ini.try_into().expect("parse");
         assert!(!parsed.varlink.no_fallback);
     }
@@ -1354,15 +1269,7 @@ enabled = true
 [units]
 varlink = false
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(varlink_override_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(varlink_override_config);
 
         let parsed_config: Config = ini_config.try_into().expect("Failed to parse config");
         assert!(parsed_config.varlink.enabled);
@@ -1472,15 +1379,7 @@ varlink = false
             },
         };
 
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(FULL_CONFIG.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(FULL_CONFIG);
 
         // See everything set / overloaded ...
         let actual_config: Config = ini_config.try_into().expect("Failed to parse config");
@@ -1490,15 +1389,7 @@ varlink = false
     #[test]
     fn test_invalid_config_returns_error() {
         let invalid_config = "[monitord]\ndaemon = notabool\noutput_format = json\n";
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(invalid_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(invalid_config);
 
         let result: Result<Config, _> = ini_config.try_into();
         assert!(result.is_err());
