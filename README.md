@@ -1124,18 +1124,6 @@ Ensure the following pass before submitting a PR (CI checks):
 4. If you have commit bit, push directly to main. Otherwise, push a branch and open a PR.
 5. Cut a GitHub release: `gh release create X.Y.Z --title "X.Y.Z" --generate-notes`
 
-### Generate codegen APIs
-
-- `cargo install zbus_xmlgen`
-- `zbus-xmlgen system org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/chronyd_2eservice`
-
-Then add the following macros to tell clippy to go away:
-
-```rust
-#![allow(warnings)]
-#![allow(clippy)]
-```
-
 ### Non Linux development
 
 Sometimes I develop from my Mac OS X laptop. So I thought I'd document and
@@ -1218,7 +1206,9 @@ monitord can be used as a Rust library. See the full API documentation at [monit
 
 ## DBus
 
-All monitord's dbus is done via async (tokio) [zbus](https://crates.io/crates/zbus) crate.
+monitord uses [zbus](https://crates.io/crates/zbus) with Tokio for D-Bus.
+The [zbus_systemd](https://docs.rs/zbus_systemd) crate supplies the generated
+proxies for systemd, machined, and networkd.
 
 systemd Dbus APIs are in use in the following modules:
 
@@ -1232,7 +1222,7 @@ systemd Dbus APIs are in use in the following modules:
     ifindex→name map read from `/sys/class/net/*/ifindex` (no D-Bus); the varlink
     `io.systemd.Network.Describe` API can be enabled instead (see below)
 - system
-  - `ManagerProxy::get_version()`
+  - `ManagerProxy::version()`
   - `ManagerProxy::system_state()`
 - timer
   - `TimerProxy::unit()` - Find service unit of timer
@@ -1242,11 +1232,11 @@ systemd Dbus APIs are in use in the following modules:
 - units
   - `ManagerProxy::list_units()` - Main counting of unit stats
   - `ServiceProxy::control_group()` + `ServiceProxy::main_pid()` + `ServiceProxy::control_pid()` - Locate the unit's cgroup and fold PIDs living outside it into the process count, the way `GetProcesses` does
-  - `ServiceProxy::nrestarts()`
-  - `ServiceProxy::restart_usec()`
+  - `ServiceProxy::n_restarts()`
+  - `ServiceProxy::restart_u_sec()`
   - `ServiceProxy::status_errno()`
-  - `ServiceProxy::timeout_clean_usec()`
-  - `ServiceProxy::watchdog_usec()`
+  - `ServiceProxy::timeout_clean_u_sec()`
+  - `ServiceProxy::watchdog_u_sec()`
   - Per-service cgroup accounting (`cpuusage_nsec`, `ioread_bytes`, `ioread_operations`,
     `memory_current`, `memory_available`, `tasks_current`, process count) is read from
     cgroupfs (`cpu.stat`, `memory.current`/`max`/`high`, `pids.current`, `io.stat`,

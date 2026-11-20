@@ -14,10 +14,9 @@ use anyhow::{anyhow, Result};
 use tokio::sync::RwLock;
 use tracing::debug;
 use zbus::ObjectPath;
+use zbus_systemd::systemd1::{ManagerProxy, UnitProxy};
 
 use crate::config::Config;
-use crate::dbus::zbus_systemd::ManagerProxy;
-use crate::dbus::zbus_unit::UnitProxy;
 use crate::MachineStats;
 
 /// Boot blame statistics: maps unit name to activation time in seconds

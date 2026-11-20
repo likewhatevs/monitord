@@ -53,7 +53,7 @@ pub async fn collect_timer_stats(
 ) -> Result<TimerStats, MonitordTimerError> {
     let mut timer_stats = TimerStats::default();
 
-    let pt = crate::dbus::zbus_timer::TimerProxy::builder(connection)
+    let pt = zbus_systemd::systemd1::TimerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .path(unit.unit_object_path.clone())
         .build()
@@ -67,13 +67,13 @@ pub async fn collect_timer_stats(
         error!("{}: No service unit name found for timer.", unit.name);
     } else {
         // Get the object path of the service unit
-        let mp = crate::dbus::zbus_systemd::ManagerProxy::builder(connection)
+        let mp = zbus_systemd::systemd1::ManagerProxy::builder(connection)
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
-        let service_unit_path = mp.get_unit(&service_unit).await?;
+        let service_unit_path = mp.get_unit(service_unit).await?;
         // Create a UnitProxy with the unit path to async get the two counters we want
-        let up = crate::dbus::zbus_unit::UnitProxy::builder(connection)
+        let up = zbus_systemd::systemd1::UnitProxy::builder(connection)
             .cache_properties(zbus::proxy::CacheProperties::No)
             .path(service_unit_path)
             .build()
@@ -104,14 +104,14 @@ pub async fn collect_timer_stats(
         randomized_delay_usec,
         remain_after_elapse,
     ) = tokio::join!(
-        pt.accuracy_usec(),
+        pt.accuracy_u_sec(),
         pt.fixed_random_delay(),
-        pt.last_trigger_usec(),
-        pt.last_trigger_usec_monotonic(),
+        pt.last_trigger_u_sec(),
+        pt.last_trigger_u_sec_monotonic(),
         pt.persistent(),
-        pt.next_elapse_usec_monotonic(),
-        pt.next_elapse_usec_realtime(),
-        pt.randomized_delay_usec(),
+        pt.next_elapse_u_sec_monotonic(),
+        pt.next_elapse_u_sec_realtime(),
+        pt.randomized_delay_u_sec(),
         pt.remain_after_elapse(),
     );
 
