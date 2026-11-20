@@ -9,7 +9,7 @@
 //! `<socket name>.<field>`. Sources monitord already parses into typed stats
 //! (`io.systemd.Manager`, `io.systemd.Network`) and monitord's own source
 //! (`io.monitord`) are skipped during socket discovery. Configured commands
-//! supply metric records under their source name.
+//! supply metric records or a single JSON number under their source name.
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::warn;
 
-use crate::config::ReportConfig;
+use crate::config::{ReportCommand, ReportCommandFormat, ReportConfig};
 use crate::varlink::metrics::{ListOutput, Metrics, MetricsError};
 use crate::MonitordStats;
 
@@ -385,37 +385,60 @@ async fn list_source(path: PathBuf, timeout: Duration) -> anyhow::Result<Vec<Lis
     .await?
 }
 
-fn parse_command_output(stdout: &[u8]) -> anyhow::Result<(Vec<ListOutput>, u64)> {
-    let text = std::str::from_utf8(stdout).context("stdout is not UTF-8")?;
-    let mut metrics = Vec::new();
-    let mut dropped = 0;
-    for (index, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
+fn number_metric(source: &str, value: serde_json::Value) -> ListOutput {
+    ListOutput {
+        name: format!("{source}.value"),
+        value,
+        object: None,
+        fields: None,
+    }
+}
+
+fn parse_command_output(
+    source: &str,
+    format: ReportCommandFormat,
+    stdout: &[u8],
+) -> anyhow::Result<(Vec<ListOutput>, u64)> {
+    match format {
+        ReportCommandFormat::Number => {
+            let value: serde_json::Value =
+                serde_json::from_slice(stdout).context("invalid JSON number")?;
+            anyhow::ensure!(value.is_number(), "expected one finite JSON number");
+            Ok((vec![number_metric(source, value)], 0))
         }
-        let value: serde_json::Value = serde_json::from_str(line)
-            .with_context(|| format!("invalid JSON on line {}", index + 1))?;
-        anyhow::ensure!(value.is_object(), "line {} is not a JSON object", index + 1);
-        anyhow::ensure!(
-            value.get("value").is_some(),
-            "line {} has no value",
-            index + 1
-        );
-        let metric: ListOutput = serde_json::from_value(value)
-            .with_context(|| format!("invalid metric on line {}", index + 1))?;
-        if metrics.len() < METRICS_PER_SOURCE_MAX {
-            metrics.push(metric);
-        } else {
-            dropped += 1;
+        ReportCommandFormat::Records => {
+            let text = std::str::from_utf8(stdout).context("stdout is not UTF-8")?;
+            let mut metrics = Vec::new();
+            let mut dropped = 0;
+            for (index, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: serde_json::Value = serde_json::from_str(line)
+                    .with_context(|| format!("invalid JSON on line {}", index + 1))?;
+                anyhow::ensure!(value.is_object(), "line {} is not a JSON object", index + 1);
+                anyhow::ensure!(
+                    value.get("value").is_some(),
+                    "line {} has no value",
+                    index + 1
+                );
+                let metric: ListOutput = serde_json::from_value(value)
+                    .with_context(|| format!("invalid metric on line {}", index + 1))?;
+                if metrics.len() < METRICS_PER_SOURCE_MAX {
+                    metrics.push(metric);
+                } else {
+                    dropped += 1;
+                }
+            }
+            anyhow::ensure!(!metrics.is_empty(), "stdout has no metrics");
+            Ok((metrics, dropped))
         }
     }
-    anyhow::ensure!(!metrics.is_empty(), "stdout has no metrics");
-    Ok((metrics, dropped))
 }
 
 /// Run inside the source's task, which outlives cancellation of collection.
 /// Read stdout before waiting, including data written by descendants.
-async fn run_command(command: PathBuf, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+async fn run_command(command: ReportCommand, timeout: Duration) -> anyhow::Result<Vec<u8>> {
     run_command_inner(
         command,
         timeout,
@@ -432,20 +455,20 @@ struct CommandWaitGate {
 }
 
 async fn run_command_inner(
-    command: PathBuf,
+    command: ReportCommand,
     timeout: Duration,
     #[cfg(test)] wait_gate: Option<CommandWaitGate>,
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
-        command.is_absolute(),
+        command.path.is_absolute(),
         "report command path must be absolute: {}",
-        command.display()
+        command.path.display()
     );
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .context("report command timeout exceeds the clock range")?;
-    let (mut child, group) = command_group::CommandGroup::spawn(&command)
-        .with_context(|| format!("unable to execute {}", command.display()))?;
+    let (mut child, group) = command_group::CommandGroup::spawn(&command.path)
+        .with_context(|| format!("unable to execute {}", command.path.display()))?;
     #[cfg(test)]
     let pgid = child.id().expect("a newly spawned child has an ID") as libc::pid_t;
     let mut stdout = Vec::new();
@@ -504,19 +527,20 @@ async fn run_command_inner(
 
 async fn command_source(
     source: String,
-    command: PathBuf,
+    command: ReportCommand,
     metric_blocklist: HashSet<String>,
     timeout: Duration,
 ) -> (String, ReportSource) {
-    let result = run_command(command, timeout)
+    let result = run_command(command.clone(), timeout)
         .await
-        .and_then(|stdout| parse_command_output(&stdout));
-    let report_source = command_result(&source, &metric_blocklist, result);
+        .and_then(|stdout| parse_command_output(&source, command.format, &stdout));
+    let report_source = command_result(&source, command.format, &metric_blocklist, result);
     (source, report_source)
 }
 
 fn command_result(
     source: &str,
+    format: ReportCommandFormat,
     metric_blocklist: &HashSet<String>,
     result: anyhow::Result<(Vec<ListOutput>, u64)>,
 ) -> ReportSource {
@@ -531,7 +555,14 @@ fn command_result(
         }
         Err(error) => {
             warn!("Unable to collect report source {}: {:#}", source, error);
-            ReportSource::default()
+            let mut failed = match format {
+                ReportCommandFormat::Number => {
+                    normalize_metrics(source, &[number_metric(source, 0.into())], metric_blocklist)
+                }
+                ReportCommandFormat::Records => ReportSource::default(),
+            };
+            failed.up = false;
+            failed
         }
     }
 }
@@ -1036,13 +1067,18 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    fn command_fixture(dir: &Path, name: &str, body: &str) -> PathBuf {
+    fn command_fixture(
+        dir: &Path,
+        name: &str,
+        body: &str,
+        format: ReportCommandFormat,
+    ) -> ReportCommand {
         let path = dir.join(name);
         write_executable_fixture(&path, &format!("#!/bin/sh\n{body}\n"));
-        path
+        ReportCommand { path, format }
     }
 
-    fn command_config(command: PathBuf) -> ReportConfig {
+    fn command_config(command: ReportCommand) -> ReportConfig {
         ReportConfig {
             commands: BTreeMap::from([("com.example.check".to_string(), command)]),
             ..Default::default()
@@ -1062,21 +1098,51 @@ mod tests {
             br#"{"name":"com.example.check.a","value":0}
 junk"#,
         ] {
-            assert!(parse_command_output(output).is_err(), "{output:?}");
+            assert!(
+                parse_command_output("com.example.check", ReportCommandFormat::Records, output)
+                    .is_err(),
+                "{output:?}"
+            );
+        }
+        for output in [
+            "", "true", "\"1\"", "null", "NaN", "Infinity", "1e999", "1 2",
+        ] {
+            assert!(
+                parse_command_output(
+                    "com.example.check",
+                    ReportCommandFormat::Number,
+                    output.as_bytes()
+                )
+                .is_err(),
+                "{output}"
+            );
         }
         let record = r#"{"name":"com.example.check.a","value":1}"#;
         let mut output = format!("{record}\n").repeat(METRICS_PER_SOURCE_MAX + 1);
-        let (retained, dropped) = parse_command_output(output.as_bytes()).unwrap();
+        let (retained, dropped) = parse_command_output(
+            "com.example.check",
+            ReportCommandFormat::Records,
+            output.as_bytes(),
+        )
+        .unwrap();
         assert_eq!(retained.len(), METRICS_PER_SOURCE_MAX);
         assert_eq!(dropped, 1);
         output.push_str("bad line\n");
-        assert!(parse_command_output(output.as_bytes()).is_err());
+        assert!(parse_command_output(
+            "com.example.check",
+            ReportCommandFormat::Records,
+            output.as_bytes()
+        )
+        .is_err());
     }
 
     #[tokio::test]
     async fn test_command_requires_absolute_path() {
         for path in ["true", "./true"] {
-            let command = PathBuf::from(path);
+            let command = ReportCommand {
+                path: path.into(),
+                format: ReportCommandFormat::Number,
+            };
             let error = run_command(command, Duration::from_secs(5))
                 .await
                 .unwrap_err();
@@ -1093,7 +1159,8 @@ junk"#,
         let command = command_fixture(
             dir.path(),
             "helper",
-            r#"printf '{"name":"com.example.check.value","value":7}'"#,
+            "printf 7",
+            ReportCommandFormat::Number,
         );
         let stats = collect_report_stats(
             dir.path(),
@@ -1104,34 +1171,45 @@ junk"#,
         .unwrap();
         let source = &stats["com.example.check"];
         assert!(!source.up);
-        assert!(source.metrics.is_empty());
+        assert_eq!(source.metrics["value"], 0);
     }
 
     #[tokio::test]
     async fn test_command_success_and_failure_rules() {
         let dir = tempfile::tempdir().unwrap();
-        for (index, (body, up, value)) in [
+        for (index, (body, format, up, value)) in [
+            ("printf '0\\n'", ReportCommandFormat::Number, true, Some(0)),
+            (
+                "printf '5'; exit 1",
+                ReportCommandFormat::Number,
+                false,
+                Some(0),
+            ),
+            ("printf 'bad'", ReportCommandFormat::Number, false, Some(0)),
             (
                 r#"printf '{"name":"com.example.check.value","value":2}\n'"#,
+                ReportCommandFormat::Records,
                 true,
                 Some(2),
             ),
             (
                 r#"printf '{"name":"com.example.check.value","value":2}\nbad'"#,
+                ReportCommandFormat::Records,
                 false,
                 None,
             ),
             (
                 r#"printf '{"name":"com.example.check.value","value":2}\n'; exit 1"#,
+                ReportCommandFormat::Records,
                 false,
                 None,
             ),
-            ("exit 0", false, None),
+            ("exit 0", ReportCommandFormat::Records, false, None),
         ]
         .into_iter()
         .enumerate()
         {
-            let command = command_fixture(dir.path(), &format!("helper{index}"), body);
+            let command = command_fixture(dir.path(), &format!("helper{index}"), body, format);
             let stats = collect_report_stats(
                 &dir.path().join("missing"),
                 &command_config(command),
@@ -1147,6 +1225,16 @@ junk"#,
                 "case {index}"
             );
         }
+        let command = command_fixture(dir.path(), "fail", "exit 1", ReportCommandFormat::Number);
+        let mut config = command_config(command);
+        config
+            .metric_blocklist
+            .insert("com.example.check.value".into());
+        let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!stats["com.example.check"].up);
+        assert!(stats["com.example.check"].metrics.is_empty());
     }
 
     #[tokio::test]
@@ -1156,10 +1244,8 @@ junk"#,
         let command = command_fixture(
             dir.path(),
             "helper",
-            &format!(
-                r#"touch '{}'; printf '{{"name":"com.example.check.value","value":3}}'"#,
-                marker.display()
-            ),
+            &format!("touch '{}'; printf 3", marker.display()),
+            ReportCommandFormat::Number,
         );
         let mut config = command_config(command);
         // Names clash case-insensitively; even a dead admitted socket wins.
@@ -1192,10 +1278,8 @@ junk"#,
         let command = command_fixture(
             dir.path(),
             "helper",
-            &format!(
-                r#"printf x >> '{}'; printf '{{"name":"com.example.Check.value","value":7}}'"#,
-                calls.display()
-            ),
+            &format!("printf x >> '{}'; printf 7", calls.display()),
+            ReportCommandFormat::Number,
         );
         let config = ReportConfig {
             commands: BTreeMap::from([
@@ -1215,6 +1299,12 @@ junk"#,
     #[tokio::test]
     async fn test_commands_ignore_socket_filters_and_reserved_names() {
         let dir = tempfile::tempdir().unwrap();
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            "printf 7",
+            ReportCommandFormat::Number,
+        );
         let names: Vec<_> = SKIP_SOURCES
             .iter()
             .map(|name| name.to_lowercase())
@@ -1223,14 +1313,7 @@ junk"#,
         let config = ReportConfig {
             commands: names
                 .iter()
-                .map(|name| {
-                    let command = command_fixture(
-                        dir.path(),
-                        name,
-                        &format!(r#"printf '{{"name":"{name}.value","value":7}}'"#),
-                    );
-                    (name.clone(), command)
-                })
+                .map(|name| (name.clone(), command.clone()))
                 .collect(),
             allowlist: HashSet::from(["com.example.unrelated".to_string()]),
             blocklist: names.iter().cloned().collect(),
@@ -1250,23 +1333,41 @@ junk"#,
     async fn test_command_stdout_limit_includes_every_byte() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("output");
-        let value = r#"{"name":"com.example.check.value","value":7}"#;
-        let command = command_fixture(dir.path(), "helper", &format!("cat '{}'", output.display()));
-        let mut bytes = vec![b' '; COMMAND_STDOUT_MAX];
-        bytes[..value.len()].copy_from_slice(value.as_bytes());
-        std::fs::write(&output, &bytes).unwrap();
-        let read = run_command(command.clone(), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(read.len(), COMMAND_STDOUT_MAX);
-        assert_eq!(parse_command_output(&read).unwrap().0[0].value, 7);
-        bytes.push(b' ');
-        std::fs::write(&output, &bytes).unwrap();
-        assert!(run_command(command, Duration::from_secs(5))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("16 MiB"));
+        for (format, value) in [
+            (ReportCommandFormat::Number, "7"),
+            (
+                ReportCommandFormat::Records,
+                r#"{"name":"com.example.check.value","value":7}"#,
+            ),
+        ] {
+            let command = command_fixture(
+                dir.path(),
+                "helper",
+                &format!("cat '{}'", output.display()),
+                format,
+            );
+            let mut bytes = vec![b' '; COMMAND_STDOUT_MAX];
+            bytes[..value.len()].copy_from_slice(value.as_bytes());
+            std::fs::write(&output, &bytes).unwrap();
+            let read = run_command(command.clone(), Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(read.len(), COMMAND_STDOUT_MAX);
+            assert_eq!(
+                parse_command_output("com.example.check", format, &read)
+                    .unwrap()
+                    .0[0]
+                    .value,
+                7
+            );
+            bytes.push(b' ');
+            std::fs::write(&output, &bytes).unwrap();
+            assert!(run_command(command, Duration::from_secs(5))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("16 MiB"));
+        }
     }
 
     // These process tests pause Tokio's clock until the real helper signals
@@ -1346,6 +1447,7 @@ printf 7"#,
                 dir.path().display(),
                 release.display()
             ),
+            ReportCommandFormat::Number,
         );
         let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
         let ids = read_pids(&pids).await;
@@ -1366,6 +1468,7 @@ printf 7"#,
             dir.path(),
             "helper",
             &format!("echo $$ > '{}'\nexec sleep 5", pids.display()),
+            ReportCommandFormat::Records,
         );
         let task = tokio::spawn(run_command(command, Duration::from_secs(15)));
         let ids = read_pids(&pids).await;
@@ -1394,6 +1497,7 @@ printf 7"#,
                 dir.path().display(),
                 pids.display()
             ),
+            ReportCommandFormat::Number,
         );
         let (waiting, mut at_wait) = tokio::sync::oneshot::channel();
         let (resume, gate) = tokio::sync::oneshot::channel();
@@ -1426,9 +1530,14 @@ printf 7"#,
                 .raw_os_error(),
             Some(libc::ECHILD)
         );
-        let source = command_result("com.example.check", &HashSet::new(), Err(error));
+        let source = command_result(
+            "com.example.check",
+            ReportCommandFormat::Number,
+            &HashSet::new(),
+            Err(error),
+        );
         assert!(!source.up);
-        assert!(source.metrics.is_empty());
+        assert_eq!(source.metrics["value"], 0);
         let descendant = std::fs::read_to_string(format!("/proc/{}/stat", ids[1])).unwrap();
         let fields: Vec<_> = descendant
             .rsplit_once(") ")
@@ -1455,6 +1564,7 @@ printf 7"#,
                 r#"timeout --foreground -s KILL 60 sh -c 'printf "%s %s\n" "$1" "$$" > "$2"; kill -STOP $$' sh "$$" '{}' &"#,
                 pids.display()
             ),
+            ReportCommandFormat::Number,
         );
         let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
         let ids = read_pids(&pids).await;
@@ -1496,6 +1606,7 @@ printf '%s %s\n' "$$" "$!" > '{}'
 exit 0"#,
                 pids.display()
             ),
+            ReportCommandFormat::Number,
         );
         let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
         let ids = read_pids(&pids).await;
@@ -1527,6 +1638,7 @@ exit 0"#,
 exec sleep 60"#,
                 pids.display()
             ),
+            ReportCommandFormat::Number,
         );
         let config = command_config(command);
         let path = dir.path().to_owned();
@@ -1554,6 +1666,7 @@ printf '%s %s\n' "$$" "$!" > '{}'
 exec yes"#,
                 pids.display()
             ),
+            ReportCommandFormat::Records,
         );
         let task = tokio::spawn(run_command(command, Duration::from_secs(5)));
         let ids = read_pids(&pids).await;
@@ -1587,7 +1700,12 @@ exec yes"#,
                 .unwrap();
         server.await.unwrap();
         std::fs::remove_file(socket_path).unwrap();
-        let command = command_fixture(dir.path(), "helper", &format!("printf '%s\\n' '{record}'"));
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!("printf '%s\\n' '{record}'"),
+            ReportCommandFormat::Records,
+        );
         let command_stats =
             collect_report_stats(dir.path(), &command_config(command), Duration::from_secs(5))
                 .await
@@ -1610,6 +1728,7 @@ printf '%s\n' "$$" > '{}'
 exec sleep 60"#,
                 pids.display()
             ),
+            ReportCommandFormat::Number,
         );
         let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
         let ids = read_pids(&pids).await;
@@ -1626,16 +1745,16 @@ exec sleep 60"#,
     async fn test_commands_do_not_invoke_a_shell_for_scripts_without_shebang() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("helper");
-        write_executable_fixture(
-            &path,
-            r#"printf '{"name":"com.example.check.value","value":123}'"#,
-        );
-        let config = command_config(path);
+        write_executable_fixture(&path, "printf 123\n");
+        let config = command_config(ReportCommand {
+            path,
+            format: ReportCommandFormat::Number,
+        });
         let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
             .await
             .unwrap();
         assert!(!stats["com.example.check"].up);
-        assert!(stats["com.example.check"].metrics.is_empty());
+        assert_eq!(stats["com.example.check"].metrics["value"], 0);
     }
 
     #[tokio::test]
@@ -1645,7 +1764,8 @@ exec sleep 60"#,
             dir.path(),
             "helper --not-an-argument",
             r#"[ "$#" -eq 0 ] || exit 1
-printf '{"name":"com.example.check.value","value":7}'"#,
+printf 7"#,
+            ReportCommandFormat::Number,
         );
         let stats =
             collect_report_stats(dir.path(), &command_config(command), Duration::from_secs(5))

@@ -312,6 +312,22 @@ pub struct VarlinkConfig {
     pub no_fallback: bool,
 }
 
+/// Output format of a configured report command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportCommandFormat {
+    /// One `io.systemd.Metrics.List` JSON object per nonblank line.
+    Records,
+    /// One finite JSON number, exposed as `<source>.value`.
+    Number,
+}
+
+/// A trusted executable run directly, with no arguments or shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReportCommand {
+    pub path: PathBuf,
+    pub format: ReportCommandFormat,
+}
+
 /// `[report]` section: serve monitord's own health metrics to
 /// `systemd-report` over `io.systemd.Metrics` (see `crate::report`), and
 /// collect other systemd-report sources (`/run/systemd/report/*`, systemd
@@ -341,7 +357,7 @@ pub struct ReportConfig {
     pub metric_blocklist: HashSet<String>,
     /// Explicit command sources, keyed by lowercased interface name. Socket
     /// source filters do not apply to these opt-in sources.
-    pub commands: BTreeMap<String, PathBuf>,
+    pub commands: BTreeMap<String, ReportCommand>,
 }
 
 /// Config struct
@@ -672,22 +688,34 @@ impl TryFrom<Ini> for Config {
             config.report.metric_blocklist =
                 metric_blocklist.keys().map(|s| s.to_string()).collect();
         }
-        if let Some(commands) = config_map.get("report.commands") {
-            for (name, value) in commands {
-                let invalid = |reason: &str| MonitordConfigError::InvalidValue {
-                    section: "report.commands".to_string(),
-                    key: name.clone(),
-                    reason: reason.to_string(),
-                };
-                if !crate::report_collector::interface_name_is_valid(name) {
-                    return Err(invalid("expected a Varlink interface name"));
+        for (section, format) in [
+            ("report.commands", ReportCommandFormat::Records),
+            ("report.commands.number", ReportCommandFormat::Number),
+        ] {
+            if let Some(commands) = config_map.get(section) {
+                for (name, value) in commands {
+                    let invalid = |reason: &str| MonitordConfigError::InvalidValue {
+                        section: section.to_string(),
+                        key: name.clone(),
+                        reason: reason.to_string(),
+                    };
+                    if !crate::report_collector::interface_name_is_valid(name) {
+                        return Err(invalid("expected a Varlink interface name"));
+                    }
+                    let path = value
+                        .as_deref()
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_absolute())
+                        .ok_or_else(|| invalid("expected an absolute executable path"))?;
+                    if config
+                        .report
+                        .commands
+                        .insert(name.clone(), ReportCommand { path, format })
+                        .is_some()
+                    {
+                        return Err(invalid("source appears in both command sections"));
+                    }
                 }
-                let path = value
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .ok_or_else(|| invalid("expected an absolute executable path"))?;
-                config.report.commands.insert(name.clone(), path);
             }
         }
 
@@ -787,6 +815,7 @@ const DATA_SECTIONS: &[&str] = &[
     "report.sources.blocklist",
     "report.metrics.blocklist",
     "report.commands",
+    "report.commands.number",
 ];
 
 /// Unrecognized sections and keys, for warn-on-typo diagnostics.
@@ -1476,7 +1505,7 @@ varlink = false
     }
 
     #[test]
-    fn test_report_commands_validate_names_and_paths() {
+    fn test_report_commands_validate_names_paths_and_duplicates() {
         for text in [
             r###"
 [report.commands]
@@ -1489,6 +1518,13 @@ com.example.check
             r###"
 [report.commands]
 bad = /bin/true
+"###,
+            r###"
+[report.commands]
+com.example.check = /bin/true
+
+[report.commands.number]
+COM.EXAMPLE.CHECK = /bin/false
 "###,
         ] {
             let invalid_config = format!(
@@ -1508,13 +1544,24 @@ output_format = json
 
 [report.commands]
 COM.EXAMPLE.Check = /usr/libexec/Record With Spaces
+
+[report.commands.number]
+io.monitord = /usr/libexec/Number
 "###;
         let ini_config = load_ini(commands_config);
         assert!(unknown_config_entries(ini_config.get_map_ref()).is_empty());
         let config: Config = ini_config.try_into().expect("Failed to parse config");
         assert_eq!(
-            config.report.commands["com.example.check"],
+            config.report.commands["com.example.check"].path,
             PathBuf::from("/usr/libexec/Record With Spaces")
+        );
+        assert_eq!(
+            config.report.commands["com.example.check"].format,
+            ReportCommandFormat::Records
+        );
+        assert_eq!(
+            config.report.commands["io.monitord"].format,
+            ReportCommandFormat::Number
         );
     }
 }

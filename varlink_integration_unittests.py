@@ -63,7 +63,7 @@ class ReportCommandOutputTest(unittest.TestCase):
     def test_requires_successful_zero_socket_sample(self) -> None:
         prefix = f"monitord.report.{vit.REPORT_COMMAND_SOURCE}"
         self.assertFalse(vit.check_report_command_output("{"))
-        down = json.dumps({f"{prefix}.up": 0})
+        down = json.dumps({f"{prefix}.up": 0, f"{prefix}.metrics.value": 0})
         self.assertFalse(vit.check_report_command_output(down))
         good = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 0})
         self.assertTrue(vit.check_report_command_output("{}\n" + good + "\n{"))
@@ -73,7 +73,7 @@ class ReportCommandOutputTest(unittest.TestCase):
 
     def test_tracing_before_and_between_pretty_samples(self) -> None:
         prefix = f"monitord.report.{vit.REPORT_COMMAND_SOURCE}"
-        down = json.dumps({f"{prefix}.up": 0}, indent=2)
+        down = json.dumps({f"{prefix}.up": 0, f"{prefix}.metrics.value": 0}, indent=2)
         good = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 0}, indent=2)
         log = (
             'D1119 07:30:01.843293 5513 src/main.rs:63] '

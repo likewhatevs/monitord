@@ -808,6 +808,9 @@ With `[report] collect = true`, trusted executables can publish the same metrics
 ```ini
 [report.commands]
 com.example.raid = /usr/libexec/monitord/raid-health
+
+[report.commands.number]
+com.example.free-fds = /usr/libexec/monitord/free-fds
 ```
 
 A record command writes one JSON object per nonblank stdout line, for example
@@ -818,11 +821,15 @@ same shape as `io.systemd.Metrics.List`. Every line must parse, even past the
 start with the lowercased source name followed by a dot; the normal metric
 validation, blocklist, key construction and record cap apply.
 
-Success requires exit status 0, complete valid stdout, and finishing within
-`[monitord] dbus_timeout`. Empty stdout, output over 16 MiB, timeout, execution
-failure, nonzero exit or invalid output reports `up = 0` with no metrics.
+A number command writes one finite JSON number. It becomes `<source>.value`,
+e.g. `report.com.example.free-fds.metrics.value` in json-flat. Success requires
+exit status 0, complete valid stdout, and finishing within `[monitord]
+dbus_timeout`. Empty stdout, output over 16 MiB, timeout, execution failure,
+nonzero exit or invalid output reports `up = 0`. A failed number source emits
+`value = 0` (unless its metric is blocked); a real zero has `up = 1`. A failed
+record source has no metrics, like a failed socket source.
 
-Source names must be Varlink interface names.
+Source names must be Varlink interface names and cannot appear in both sections.
 The INI parser folds names to lowercase but preserves executable path case. Values
 are absolute executable paths, with no arguments, shell or PATH lookup; put
 arguments in a wrapper script with a `#!` line. Paths cannot contain `;` or `#`,

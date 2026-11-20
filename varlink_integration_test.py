@@ -1597,10 +1597,10 @@ def build_report_conf(varlink_conf: str) -> str:
 
 
 def build_command_report_conf(report_conf: str) -> str:
-    """Enable collection and a record command while serving the activated fd."""
+    """Enable collection and a number command while serving the activated fd."""
     conf = replace_once(report_conf, "collect = false", "collect = true")
     return conf + (
-        "\n[report.commands]\n"
+        "\n[report.commands.number]\n"
         f"{REPORT_COMMAND_SOURCE} = {REPORT_COMMAND_HELPER}\n"
     )
 
@@ -1724,7 +1724,7 @@ def assert_report_socket(container: str, repo: Path) -> None:
         "for fd in /proc/$$/fd/*; do\n"
         "    if [ -S \"$fd\" ]; then count=$((count + 1)); fi\n"
         "done\n"
-        f"printf '{{\"name\":\"{REPORT_COMMAND_SOURCE}.value\",\"value\":%s}}\\n' \"$count\"\n",
+        "printf '%s\\n' \"$count\"\n",
     )
     docker_exec(container, "chmod", "755", REPORT_COMMAND_HELPER)
     # A reused container may still have output from a previous run.
