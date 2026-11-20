@@ -179,13 +179,16 @@ async fn get_machines_dbus(
 
     let machines = c.list_machines().await?;
 
-    for (name, _, _, _) in filter_machines(
+    for (name, _, _, path) in filter_machines(
         machines,
         &config.machines.allowlist,
         &config.machines.blocklist,
     ) {
-        let path = c.get_machine(name.clone()).await?;
-        let m = MachineProxy::builder(connection).path(path).build().await?;
+        let m = MachineProxy::builder(connection)
+            .path(path)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?;
         let leader_pid = m.leader().await?;
         results.insert(name, leader_pid);
     }
