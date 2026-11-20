@@ -9,6 +9,7 @@ pass/fail — so they get tested here:
 """
 
 import unittest
+from unittest.mock import patch
 
 import varlink_integration_test as vit
 
@@ -495,6 +496,22 @@ class ShippedUnitPropertiesTest(unittest.TestCase):
             self.assertFalse(any(v.startswith(key) for v in values), key)
 
 
+class ReportLifecycleTest(unittest.TestCase):
+    def test_resets_only_failed_report_unit(self) -> None:
+        for state in ("inactive\n", "failed\n"):
+            with self.subTest(state=state), patch.object(
+                vit, "docker_exec", return_value=state
+            ) as run:
+                vit.reset_failed_report_service("fixture")
+                if state == "failed\n":
+                    self.assertEqual(run.call_count, 2)
+                    run.assert_called_with(
+                        "fixture", "systemctl", "reset-failed", "monitord.service"
+                    )
+                else:
+                    self.assertEqual(run.call_count, 1)
+
+
 class ReportSocketTest(unittest.TestCase):
     SERVICE = """\
 [Service]
@@ -517,6 +534,15 @@ ProtectSystem=strict
     def test_report_conf_missing_section_fails_loudly(self) -> None:
         with self.assertRaises(SystemExit):
             vit.build_report_conf("[monitord]\ndaemon = false\ndaemon_stats_refresh_secs = 60\n")
+
+    def test_daemon_conf_keeps_report_disabled(self) -> None:
+        conf = vit.build_daemon_conf(
+            "[monitord]\ndaemon = false\ndaemon_stats_refresh_secs = 60\n"
+            "[report]\nenabled = false\n"
+        )
+        self.assertIn("daemon = true", conf)
+        self.assertIn("daemon_stats_refresh_secs = 2", conf)
+        self.assertIn("[report]\nenabled = false", conf)
 
     def test_report_service_keeps_hardening(self) -> None:
         unit = vit.build_report_service(self.SERVICE, "/ctarget/monitord", "/run/c.conf", "ci")

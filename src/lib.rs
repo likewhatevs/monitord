@@ -389,8 +389,9 @@ pub(crate) async fn dbus_connection(
 ///
 /// Use one shared stats value per collection stream and run samples
 /// sequentially. A caller with its own sampling schedule must set
-/// `[monitord] daemon = false`; daemon mode loops forever. Collection
-/// counters are retained across one-shot calls that share the same stats.
+/// `[monitord] daemon = false`; daemon mode loops forever. Start a
+/// [`report::ReportServer`] with the same stats to serve collection health,
+/// including counters retained across one-shot calls.
 ///
 /// Takes an optional locked stats struct to update and to output stats to STDOUT or not.
 /// Takes an optional D-Bus connection. Returns `Some(connection)` if the
@@ -423,22 +424,6 @@ pub async fn stat_collector(
     let dbus_timeout = config.monitord.dbus_timeout;
     let mut join_set: tokio::task::JoinSet<TimedCollectorOutput> = tokio::task::JoinSet::new();
     let mut had_error;
-
-    let server_state = if config.monitord.daemon && config.report.enabled {
-        let state = Arc::new(std::sync::Mutex::new(
-            locked_monitord_stats.read().await.report_state.clone(),
-        ));
-        if let Err(e) = report::spawn_server(
-            report::REPORT_DIR.into(),
-            locked_monitord_stats.clone(),
-            state.clone(),
-        ) {
-            error!("Unable to start the systemd-report server thread: {:?}", e);
-        }
-        Some(state)
-    } else {
-        None
-    };
 
     loop {
         let collect_start_time = Instant::now();
@@ -840,12 +825,6 @@ pub async fn stat_collector(
             monitord_stats.varlink_usage = machine_stats.varlink_usage.clone();
             set_stat_collection_run_time(&mut monitord_stats, elapsed_runtime);
             monitord_stats.report_state.record_run(&timings, had_error);
-            if let Some(state) = &server_state {
-                *state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    monitord_stats.report_state.clone();
-            }
             monitord_stats.collector_timings = timings;
         }
 
@@ -926,7 +905,7 @@ enabled = true
         let stats = Arc::new(RwLock::new(MonitordStats::default()));
         for completed in 0..=2 {
             let snapshot = stats.read().await;
-            let metrics = report::build_metrics(&snapshot, &snapshot.report_state);
+            let metrics = report::build_metrics(&snapshot);
             for name in [
                 "io.monitord.collectionRunsTotal",
                 "io.monitord.collectionErrorsTotal",
