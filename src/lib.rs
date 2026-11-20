@@ -749,8 +749,7 @@ pub async fn stat_collector(
                     dbus_cell,
                     dbus_timeout,
                     stats_clone,
-                    config_clone.verify.allowlist.clone(),
-                    config_clone.verify.blocklist.clone(),
+                    &config_clone.verify,
                     metrics,
                     config_clone.varlink.no_fallback,
                 )

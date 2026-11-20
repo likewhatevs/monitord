@@ -353,6 +353,9 @@ io.systemd.Journal.HighPriorityMessage
 # Disabled by default as it can be slow on large systems
 [verify]
 enabled = false
+# Set false to skip checking Documentation=man: references. Missing manual
+# pages then cease to count as unit verification failures.
+check_man_pages = true
 
 # Optional: only verify specific units (if empty, all units are checked)
 [verify.allowlist]

@@ -217,6 +217,9 @@ pub struct BootBlameConfig {
 #[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct VerifyConfig {
     pub enabled: bool,
+    /// Check Documentation=man: references during unit verification.
+    #[default = true]
+    pub check_man_pages: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
@@ -548,6 +551,9 @@ impl TryFrom<Ini> for Config {
 
         // [verify] section
         config.verify.enabled = read_config_bool(&ini_config, "verify", "enabled")?;
+        if let Some(check) = read_config_optional_bool(&ini_config, "verify", "check_man_pages")? {
+            config.verify.check_man_pages = check;
+        }
         if let Some(varlink) = read_config_optional_bool(&ini_config, "verify", "varlink")? {
             config.verify.varlink = varlink;
         }
@@ -852,6 +858,7 @@ bar.service
 
 [verify]
 enabled = true
+check_man_pages = false
 varlink = false
 
 [varlink]
@@ -902,6 +909,7 @@ output_format = json-flat
         assert!(default_config.boot_blame.varlink);
         assert!(default_config.verify.varlink);
         assert!(default_config.dbus_stats.machine_cgroup_stats);
+        assert!(default_config.verify.check_man_pages);
     }
 
     #[test]
@@ -1263,6 +1271,7 @@ varlink = false
             },
             verify: VerifyConfig {
                 enabled: true,
+                check_man_pages: false,
                 varlink: false,
                 allowlist: HashSet::new(),
                 blocklist: HashSet::new(),

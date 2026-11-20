@@ -108,13 +108,11 @@ fn parse_verify_output(stderr: &str) -> HashSet<String> {
 /// enumerated sets without paying for a full `systemd-analyze verify` run.
 /// Sorted so the line is deterministic regardless of enumeration order.
 fn log_enumerated_units(all_units: &[String]) {
-    let mut names: Vec<&str> = all_units.iter().map(String::as_str).collect();
-    names.sort_unstable();
-    tracing::debug!(
-        "verify enumerated {} units: {}",
-        names.len(),
+    tracing::debug!("verify enumerated {} units: {}", all_units.len(), {
+        let mut names: Vec<&str> = all_units.iter().map(String::as_str).collect();
+        names.sort_unstable();
         names.join(",")
-    );
+    });
 }
 
 /// Filter unit names by the verify allowlist/blocklist.
@@ -147,9 +145,12 @@ fn filter_unit_names(
 /// The `--` separator is required: unit names like `-.mount` start with a
 /// dash and would otherwise be parsed as (bogus) options, making analyze exit
 /// before checking anything.
-fn build_verify_command(units_to_check: &[String]) -> Command {
+fn build_verify_command(units_to_check: &[String], check_man_pages: bool) -> Command {
     let mut cmd = Command::new("systemd-analyze");
     cmd.arg("verify");
+    if !check_man_pages {
+        cmd.arg("--man=no");
+    }
     cmd.arg("--");
     for unit_name in units_to_check {
         cmd.arg(unit_name);
@@ -161,7 +162,14 @@ fn build_verify_command(units_to_check: &[String]) -> Command {
 ///
 /// Shared by the D-Bus and varlink enumeration paths: only the source of the
 /// unit list differs. All units are checked in one invocation for performance.
-async fn verify_units(units_to_check: Vec<String>) -> Result<VerifyStats, MonitordVerifyError> {
+async fn verify_units(
+    all_units: Vec<String>,
+    allowlist: &HashSet<String>,
+    blocklist: &HashSet<String>,
+    check_man_pages: bool,
+) -> Result<VerifyStats, MonitordVerifyError> {
+    log_enumerated_units(&all_units);
+    let units_to_check = filter_unit_names(all_units, allowlist, blocklist);
     let mut stats = VerifyStats::default();
 
     if units_to_check.is_empty() {
@@ -169,11 +177,12 @@ async fn verify_units(units_to_check: Vec<String>) -> Result<VerifyStats, Monito
     }
 
     // Run systemd-analyze verify on all units at once for better performance
-    let output =
-        tokio::task::spawn_blocking(move || build_verify_command(&units_to_check).output())
-            .await
-            .map_err(|e| MonitordVerifyError::CommandError(e.to_string()))?
-            .map_err(|e| MonitordVerifyError::CommandError(e.to_string()))?;
+    let output = tokio::task::spawn_blocking(move || {
+        build_verify_command(&units_to_check, check_man_pages).output()
+    })
+    .await
+    .map_err(|e| MonitordVerifyError::CommandError(e.to_string()))?
+    .map_err(|e| MonitordVerifyError::CommandError(e.to_string()))?;
 
     // Parse stderr for failing units
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -197,17 +206,28 @@ pub async fn get_verify_stats(
     allowlist: &HashSet<String>,
     blocklist: &HashSet<String>,
 ) -> Result<VerifyStats, MonitordVerifyError> {
-    // Get list of all units from systemd
-    let manager_proxy = zbus_systemd::systemd1::ManagerProxy::builder(connection)
+    verify_units(
+        list_dbus_unit_names(connection).await?,
+        allowlist,
+        blocklist,
+        true,
+    )
+    .await
+}
+
+async fn list_dbus_unit_names(
+    connection: &zbus::Connection,
+) -> Result<Vec<String>, MonitordVerifyError> {
+    let manager = zbus_systemd::systemd1::ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;
-    let all_units = manager_proxy.list_units().await?;
-
-    let all_units: Vec<String> = all_units.into_iter().map(|unit| unit.0).collect();
-    log_enumerated_units(&all_units);
-    let units_to_check = filter_unit_names(all_units, allowlist, blocklist);
-    verify_units(units_to_check).await
+    Ok(manager
+        .list_units()
+        .await?
+        .into_iter()
+        .map(|unit| unit.0)
+        .collect())
 }
 
 /// Async wrapper that updates verify stats when passed a locked struct
@@ -218,21 +238,13 @@ pub(crate) async fn update_verify_stats(
     dbus: crate::DbusCell,
     dbus_timeout: u64,
     locked_machine_stats: Arc<RwLock<MachineStats>>,
-    allowlist: HashSet<String>,
-    blocklist: HashSet<String>,
+    config: &crate::config::VerifyConfig,
     metrics: Option<crate::varlink_units::SharedMetrics>,
     no_fallback: bool,
 ) -> anyhow::Result<()> {
-    let verify_stats = if let Some(metrics) = metrics {
+    let names = if let Some(metrics) = metrics {
         match crate::varlink_verify::list_unit_names(metrics).await {
-            Ok(all_units) => {
-                log_enumerated_units(&all_units);
-                locked_machine_stats.write().await.varlink_usage.verify =
-                    Some(crate::CollectorTransport::Varlink);
-                verify_units(filter_unit_names(all_units, &allowlist, &blocklist))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Error getting verify stats: {:?}", e))?
-            }
+            Ok(names) => Some(names),
             Err(err) => {
                 crate::varlink_fallback::report_varlink_failure(
                     no_fallback,
@@ -240,22 +252,35 @@ pub(crate) async fn update_verify_stats(
                     "D-Bus",
                     err,
                 )?;
-                locked_machine_stats.write().await.varlink_usage.verify =
-                    Some(crate::CollectorTransport::Dbus);
-                let connection = crate::dbus_connection(&dbus, dbus_timeout).await?;
-                get_verify_stats(&connection, &allowlist, &blocklist)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Error getting verify stats: {:?}", e))?
+                None
             }
         }
     } else {
-        locked_machine_stats.write().await.varlink_usage.verify =
-            Some(crate::CollectorTransport::Dbus);
-        let connection = crate::dbus_connection(&dbus, dbus_timeout).await?;
-        get_verify_stats(&connection, &allowlist, &blocklist)
-            .await
-            .map_err(|e| anyhow::anyhow!("Error getting verify stats: {:?}", e))?
+        None
     };
+    let names = match names {
+        Some(names) => {
+            locked_machine_stats.write().await.varlink_usage.verify =
+                Some(crate::CollectorTransport::Varlink);
+            names
+        }
+        None => {
+            locked_machine_stats.write().await.varlink_usage.verify =
+                Some(crate::CollectorTransport::Dbus);
+            let connection = crate::dbus_connection(&dbus, dbus_timeout).await?;
+            list_dbus_unit_names(&connection)
+                .await
+                .map_err(|e| anyhow::anyhow!("Error getting verify stats: {:?}", e))?
+        }
+    };
+    let verify_stats = verify_units(
+        names,
+        &config.allowlist,
+        &config.blocklist,
+        config.check_man_pages,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Error getting verify stats: {:?}", e))?;
 
     let mut machine_stats = locked_machine_stats.write().await;
     machine_stats.verify_stats = Some(verify_stats);
@@ -307,9 +332,13 @@ mod tests {
     fn test_build_verify_command_separates_flags_from_units() {
         // Units like -.mount start with a dash: without `--`, analyze parses
         // them as options and exits before checking anything.
-        let cmd = build_verify_command(&["-.mount".to_string(), "foo.service".to_string()]);
+        let units = ["-.mount".to_string(), "foo.service".to_string()];
+        let cmd = build_verify_command(&units, true);
         let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, vec!["verify", "--", "-.mount", "foo.service"]);
+        assert_eq!(args, ["verify", "--", "-.mount", "foo.service"]);
+        let cmd = build_verify_command(&units, false);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["verify", "--man=no", "--", "-.mount", "foo.service"]);
     }
 
     #[test]
