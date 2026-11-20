@@ -16,7 +16,7 @@ use tracing::{debug, error};
 use uzers::get_user_by_uid;
 use zbus::fdo::{DBusProxy, StatsProxy};
 use zbus::names::BusName;
-use zbus::{Dict, OwnedVariant, Variant};
+use zbus::{Array, Dict, OwnedVariant, Structure, Variant};
 
 use crate::MachineStats;
 
@@ -472,77 +472,42 @@ fn get_u32(dict: &Dict, key: &str) -> Option<u32> {
 
 fn get_u32_vec(dict: &Dict, key: &str) -> Option<Vec<u32>> {
     let value_key: Variant = key.into();
-    dict.get(&value_key).ok().and_then(|v| match v.flatten() {
-        Some(Variant::Array(array)) => {
-            let vec: Vec<u32> = array
-                .iter()
-                .filter_map(|item| {
-                    if let Variant::U32(num) = item {
-                        Some(*num)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            Some(vec)
-        }
-        _ => None,
-    })
+    let array = dict.get::<_, &Array>(&value_key).ok()??;
+    Some(
+        array
+            .iter()
+            .filter_map(|item| u32::try_from(item).ok())
+            .collect(),
+    )
 }
 
-/* Parse DBusBrokerPeerAccounting from OwnedVariant.
- * Expected structure:
- * struct {
- *     string ":1.2197907"
- *     array [
- *         dict entry(
- *              string "UnixUserID"
- *              variant uint32 0
- *         )
- *         ... other fields
- *     ]
- *     array [
- *         dict entry(
- *              string "NameObjects"
- *              uint32 1
- *         )
- *         ... other fields
- *     ]
- * }
- */
-
+/// PeerAccounting rows contain a unique name, a credentials dict and a stats dict.
 fn parse_peer_struct(
     peer_value: &Variant,
     well_known_to_peer_names: &HashMap<String, String>,
 ) -> Option<DBusBrokerPeerAccounting> {
-    let peer_struct = match peer_value {
-        Variant::Structure(peer_struct) => peer_struct,
-        _ => return None,
+    let peer = <&Structure>::try_from(peer_value).ok()?;
+    let [Variant::Str(id), Variant::Dict(credentials), Variant::Dict(stats), ..] = peer.fields()
+    else {
+        return None;
     };
-
-    match peer_struct.fields() {
-        [Variant::Str(id), Variant::Dict(credentials), Variant::Dict(stats), ..] => {
-            Some(DBusBrokerPeerAccounting {
-                id: id.to_string(),
-                well_known_name: well_known_to_peer_names.get(id.as_str()).cloned(),
-                unix_user_id: get_u32(credentials, "UnixUserID"),
-                process_id: get_u32(credentials, "ProcessID"),
-                unix_group_ids: get_u32_vec(credentials, "UnixGroupIDs"),
-                name_objects: get_u32(stats, "NameObjects"),
-                match_bytes: get_u32(stats, "MatchBytes"),
-                matches: get_u32(stats, "Matches"),
-                reply_objects: get_u32(stats, "ReplyObjects"),
-                incoming_bytes: get_u32(stats, "IncomingBytes"),
-                incoming_fds: get_u32(stats, "IncomingFds"),
-                outgoing_bytes: get_u32(stats, "OutgoingBytes"),
-                outgoing_fds: get_u32(stats, "OutgoingFds"),
-                activation_request_bytes: get_u32(stats, "ActivationRequestBytes"),
-                activation_request_fds: get_u32(stats, "ActivationRequestFds"),
-            })
-        }
-        _ => None,
-    }
+    Some(DBusBrokerPeerAccounting {
+        id: id.to_string(),
+        well_known_name: well_known_to_peer_names.get(id.as_str()).cloned(),
+        unix_user_id: get_u32(credentials, "UnixUserID"),
+        process_id: get_u32(credentials, "ProcessID"),
+        unix_group_ids: get_u32_vec(credentials, "UnixGroupIDs"),
+        name_objects: get_u32(stats, "NameObjects"),
+        match_bytes: get_u32(stats, "MatchBytes"),
+        matches: get_u32(stats, "Matches"),
+        reply_objects: get_u32(stats, "ReplyObjects"),
+        incoming_bytes: get_u32(stats, "IncomingBytes"),
+        incoming_fds: get_u32(stats, "IncomingFds"),
+        outgoing_bytes: get_u32(stats, "OutgoingBytes"),
+        outgoing_fds: get_u32(stats, "OutgoingFds"),
+        activation_request_bytes: get_u32(stats, "ActivationRequestBytes"),
+        activation_request_fds: get_u32(stats, "ActivationRequestFds"),
+    })
 }
 
 async fn parse_peer_accounting(
@@ -556,14 +521,8 @@ async fn parse_peer_accounting(
         return Ok(None);
     }
 
-    let value: &Variant = match owned_value {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    let peers_value = match value {
-        Variant::Array(peers_value) => peers_value,
-        _ => return Ok(None),
+    let Some(peers_value) = owned_value.and_then(|value| <&Array>::try_from(value).ok()) else {
+        return Ok(None);
     };
 
     let well_known_to_peer_names = get_well_known_to_peer_names(connection, config).await?;
@@ -659,69 +618,31 @@ fn filter_and_collect_cgroup_accounting(
     Some(result)
 }
 
-/* Parse DBusBrokerUserAccounting from OwnedVariant.
- * Expected structure:
- * struct {
- *     uint32 0
- *     array [
- *         struct {
- *             string "Bytes"
- *             uint32 536843240
- *             uint32 536870912
- *         }
- *         ... more fields
- *     ]
- *     # TODO parse usages, ignoring for now
- *     # see src/bus/driver.c:2258
- *     # the part below is not parsed
- *     array [
- *         dict entry(
- *             uint32 0
- *             array [
- *             dict entry(
- *                 string "Bytes"
- *                 uint32 27672
- *             )
- *             ... more fields
- *             ]
- *         )
- *     ]
- * }
- */
-
+/// UserAccounting rows contain a UID and (resource, current, maximum) limits.
+/// Ignore the per-user usage breakdown following the limits.
 fn parse_user_struct(user_value: &Variant) -> Option<DBusBrokerUserAccounting> {
-    let user_struct = match user_value {
-        Variant::Structure(user_struct) => user_struct,
-        _ => return None,
+    let row = <&Structure>::try_from(user_value).ok()?;
+    let [Variant::U32(uid), Variant::Array(limits), ..] = row.fields() else {
+        return None;
     };
-
-    match user_struct.fields() {
-        [Variant::U32(uid), Variant::Array(user_stats), ..] => {
-            let mut user = DBusBrokerUserAccounting::new(*uid);
-            for user_stat in user_stats.iter() {
-                if let Variant::Structure(user_stat) = user_stat {
-                    if let [Variant::Str(name), Variant::U32(cur), Variant::U32(max), ..] =
-                        user_stat.fields()
-                    {
-                        let pair = CurMaxPair {
-                            cur: *cur,
-                            max: *max,
-                        };
-                        match name.as_str() {
-                            "Bytes" => user.bytes = Some(pair),
-                            "Fds" => user.fds = Some(pair),
-                            "Matches" => user.matches = Some(pair),
-                            "Objects" => user.objects = Some(pair),
-                            _ => {} // ignore other fields
-                        }
-                    }
-                }
-            }
-
-            Some(user)
+    let mut user = DBusBrokerUserAccounting::new(*uid);
+    for limit in limits.iter().filter_map(|v| <&Structure>::try_from(v).ok()) {
+        let [Variant::Str(name), Variant::U32(cur), Variant::U32(max), ..] = limit.fields() else {
+            continue;
+        };
+        let pair = CurMaxPair {
+            cur: *cur,
+            max: *max,
+        };
+        match name.as_str() {
+            "Bytes" => user.bytes = Some(pair),
+            "Fds" => user.fds = Some(pair),
+            "Matches" => user.matches = Some(pair),
+            "Objects" => user.objects = Some(pair),
+            _ => {}
         }
-        _ => None,
     }
+    Some(user)
 }
 
 fn parse_user_accounting(
@@ -733,11 +654,7 @@ fn parse_user_accounting(
         return None;
     }
 
-    let value: &Variant = owned_value;
-    let users_value = match value {
-        Variant::Array(users_value) => users_value,
-        _ => return None,
-    };
+    let users_value = <&Array>::try_from(owned_value).ok()?;
 
     let result = users_value
         .iter()
@@ -1093,6 +1010,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_peer_struct_accepts_extra_fields() {
+        let credentials = HashMap::from([("UnixUserID", Variant::new(42u32))]);
+        let stats = HashMap::from([("NameObjects", 7u32)]);
+        let row = Variant::Structure(Structure::from((":1.23", credentials, stats, 1u32)));
+        let peer = parse_peer_struct(&row, &HashMap::new()).expect("parse extended peer row");
+        assert_eq!(peer.unix_user_id, Some(42));
+        assert_eq!(peer.name_objects, Some(7));
+    }
+
+    #[test]
+    fn test_parse_user_struct_accepts_extra_fields() {
+        let limits = vec![("Bytes", 5u32, 10u32, 1u32), ("NewLimit", 1, 2, 0)];
+        let row = Variant::Structure(Structure::from((999_999u32, limits, 1u32)));
+        let user = parse_user_struct(&row).expect("parse user with extended limits");
+        assert_eq!(user.bytes, Some(CurMaxPair { cur: 5, max: 10 }));
+
+        let row = Variant::Structure(Structure::from((999_999u32, vec![1u32])));
+        let user = parse_user_struct(&row).expect("skip malformed limit");
+        assert_eq!(user.bytes, None);
+    }
+
+    #[test]
     fn test_get_u32_and_get_u32_vec() {
         // dbus-broker credentials/stats are a{sv}, so values are variant-wrapped
         let mut dict = Dict::new(&zbus::Signature::Str, &zbus::Signature::Variant);
@@ -1108,6 +1047,8 @@ mod tests {
         assert_eq!(get_u32_vec(&dict, "UnixGroupIDs"), Some(vec![1, 2]));
         assert_eq!(get_u32_vec(&dict, "UnixUserID"), None);
         assert_eq!(get_u32_vec(&dict, "Missing"), None);
+        dict.add("OtherIDs", Variant::new(vec![1u64])).unwrap();
+        assert_eq!(get_u32_vec(&dict, "OtherIDs"), Some(Vec::new()));
     }
 
     #[test]
