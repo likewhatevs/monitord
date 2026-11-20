@@ -687,9 +687,6 @@ they are not repeated below.
   "services.chronyd.service.active_exit_timestamp": 0,
   "services.chronyd.service.cpuusage_nsec": 328951000,
   "services.chronyd.service.inactive_exit_timestamp": 1683556541360626,
-  "services.chronyd.service.ioread_bytes": 18446744073709551615,
-  "services.chronyd.service.ioread_operations": 18446744073709551615,
-  "services.chronyd.service.memory_available": 18446744073709551615,
   "services.chronyd.service.memory_current": 5214208,
   "services.chronyd.service.nrestarts": 0,
   "services.chronyd.service.processes": 1,
@@ -1141,7 +1138,15 @@ When an individual collector fails (e.g., networkd not running, D-Bus timeout), 
 
 **Large u64 values (18446744073709551615) in output**
 
-These represent `u64::MAX` and mean "not available" or "not tracked" for that metric. This is how systemd reports fields that are unsupported or not configured for the unit. The cgroup-derived service fields report `u64::MAX` only when neither cgroupfs nor the IPC fallback has data (e.g. `ioread_bytes` with the `io` controller disabled); `memory_available` in particular is computed even without limits, as host `MemAvailable`.
+Service accounting fields `cpuusage_nsec`, `ioread_bytes`, `ioread_operations`,
+`memory_available`, `memory_current`, and `tasks_current` are omitted from all
+JSON formats when systemd reports them unset (`u64::MAX`). This applies to host
+and machine services. A real zero or any other numeric value is still emitted.
+Duration and timer values such as `timeout_clean_usec` retain `u64::MAX`, which
+can mean infinity. Typed Rust service stats retain the sentinel, and omitted
+accounting fields deserialize to it; library consumers must handle it themselves.
+Cgroup-derived values are unset only when neither cgroupfs nor IPC has data;
+`memory_available` can be computed even without limits, using host `MemAvailable`.
 
 ## Library API
 

@@ -1073,6 +1073,102 @@ mod tests {
     }
 
     #[test]
+    fn test_unset_service_accounting_omitted_in_every_format_and_scope() {
+        let fields = [
+            "cpuusage_nsec",
+            "ioread_bytes",
+            "ioread_operations",
+            "memory_available",
+            "memory_current",
+            "tasks_current",
+        ];
+        let durations = ["restart_usec", "timeout_clean_usec", "watchdog_usec"];
+        for value in [0, u64::MAX - 1, u64::MAX] {
+            let omitted = if value == u64::MAX { fields.len() } else { 0 };
+            let service = units::ServiceStats {
+                cpuusage_nsec: value,
+                ioread_bytes: value,
+                ioread_operations: value,
+                memory_available: value,
+                memory_current: value,
+                tasks_current: value,
+                restart_usec: u64::MAX,
+                timeout_clean_usec: u64::MAX,
+                watchdog_usec: u64::MAX,
+                ..Default::default()
+            };
+            let mut stats = MonitordStats::default();
+            stats
+                .units
+                .service_stats
+                .insert("test.service".into(), service.clone());
+            stats.machines.insert(
+                "box".into(),
+                MachineStats {
+                    units: stats.units.clone(),
+                    ..Default::default()
+                },
+            );
+            for json in [
+                serde_json::to_string(&stats).unwrap(),
+                serde_json::to_string_pretty(&stats).unwrap(),
+            ] {
+                let nested: serde_json::Value = serde_json::from_str(&json).unwrap();
+                for units in [&nested["units"], &nested["machines"]["box"]["units"]] {
+                    let output = &units["service_stats"]["test.service"];
+                    for field in fields {
+                        if value == u64::MAX {
+                            assert!(output.get(field).is_none(), "{field}");
+                        } else {
+                            assert_eq!(output[field], value, "{field}");
+                        }
+                    }
+                    for field in durations {
+                        assert_eq!(output[field], u64::MAX, "{field}");
+                    }
+                    assert_eq!(
+                        output.as_object().unwrap().len(),
+                        units::SERVICE_FIELD_NAMES.len() - omitted
+                    );
+                }
+                // Missing fields decode to the sentinel, so typed API consumers
+                // preserve the distinction from an actual measured zero.
+                let decoded: MonitordStats = serde_json::from_str(&json).unwrap();
+                assert_eq!(decoded.units.service_stats["test.service"], service);
+                assert_eq!(
+                    decoded.machines["box"].units.service_stats["test.service"],
+                    service
+                );
+            }
+            let flat = flatten_stats(&stats, "prefix");
+            for prefix in [
+                "prefix.services.test.service",
+                "prefix.machines.box.services.test.service",
+            ] {
+                for field in fields {
+                    let key = format!("{prefix}.{field}");
+                    if value == u64::MAX {
+                        assert!(!flat.contains_key(&key), "{key}");
+                    } else {
+                        assert_eq!(flat[&key], value, "{key}");
+                    }
+                }
+                for field in durations {
+                    let key = format!("{prefix}.{field}");
+                    assert_eq!(flat[&key], u64::MAX, "{key}");
+                }
+                let service_prefix = format!("{prefix}.");
+                assert_eq!(
+                    flat.keys()
+                        .filter(|key| key.starts_with(&service_prefix))
+                        .count(),
+                    units::SERVICE_FIELD_NAMES.len() - omitted
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_boot_grace_serialization_and_legacy_states() {
         let legacy = serde_json::json!({
             "active_state": 3,

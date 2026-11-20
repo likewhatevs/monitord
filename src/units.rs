@@ -201,6 +201,12 @@ pub(crate) fn count_failed_families<'a>(
 }
 
 /// Per-service metrics from the org.freedesktop.systemd1.Service and Unit D-Bus interfaces.
+///
+/// Unavailable accounting values stay `u64::MAX` in memory and are omitted
+/// from JSON. Missing accounting fields deserialize back to `u64::MAX`;
+/// duration fields retain their numeric values, including `u64::MAX` for
+/// infinity.
+///
 /// Ref: <https://www.freedesktop.org/software/systemd/man/org.freedesktop.systemd1.html>
 #[derive(
     serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, FieldNamesAsArray, PartialEq,
@@ -211,16 +217,36 @@ pub struct ServiceStats {
     /// Realtime timestamp (usec since epoch) when the unit most recently left the active state
     pub active_exit_timestamp: u64,
     /// Total CPU time consumed by this service's cgroup in nanoseconds
+    #[serde(
+        default = "unset_service_value",
+        skip_serializing_if = "is_unset_service_value"
+    )]
     pub cpuusage_nsec: u64,
     /// Realtime timestamp (usec since epoch) when the unit most recently left the inactive state
     pub inactive_exit_timestamp: u64,
     /// Total bytes read from block I/O by this service's cgroup
+    #[serde(
+        default = "unset_service_value",
+        skip_serializing_if = "is_unset_service_value"
+    )]
     pub ioread_bytes: u64,
     /// Total number of block I/O read operations by this service's cgroup
+    #[serde(
+        default = "unset_service_value",
+        skip_serializing_if = "is_unset_service_value"
+    )]
     pub ioread_operations: u64,
     /// Memory available to the service (MemoryAvailable from cgroup), in bytes
+    #[serde(
+        default = "unset_service_value",
+        skip_serializing_if = "is_unset_service_value"
+    )]
     pub memory_available: u64,
     /// Current memory usage of the service's cgroup in bytes
+    #[serde(
+        default = "unset_service_value",
+        skip_serializing_if = "is_unset_service_value"
+    )]
     pub memory_current: u64,
     /// Number of times systemd has restarted this service (automatic restarts)
     pub nrestarts: u32,
@@ -233,11 +259,23 @@ pub struct ServiceStats {
     /// errno-style exit status code from the main process (0 = success)
     pub status_errno: i32,
     /// Current number of tasks (threads) in this service's cgroup
+    #[serde(
+        default = "unset_service_value",
+        skip_serializing_if = "is_unset_service_value"
+    )]
     pub tasks_current: u64,
     /// Timeout in microseconds for the cleanup of resources after the service exits
     pub timeout_clean_usec: u64,
     /// Watchdog timeout in microseconds; the service must ping within this interval or be killed
     pub watchdog_usec: u64,
+}
+
+fn unset_service_value() -> u64 {
+    u64::MAX
+}
+
+fn is_unset_service_value(value: &u64) -> bool {
+    *value == u64::MAX
 }
 
 /// Per-unit state tracking combining active state, load state, and computed health.
