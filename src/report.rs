@@ -1200,11 +1200,9 @@ mod tests {
     async fn test_self_bind_reclaims_a_stale_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REPORT_SOCKET_NAME);
-        // A dead owner: the socket file stays behind after its listener closes.
-        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        crate::tests::bind_stale_socket(&path);
         assert!(path.exists());
-        let _listener = bind_unless_served(&dir.path().join(REPORT_SOCKET_NAME))
-            .expect("stale socket replaced");
+        let _listener = bind_unless_served(&path).expect("stale socket replaced");
         std::os::unix::net::UnixStream::connect(&path).expect("new listener reachable");
     }
 

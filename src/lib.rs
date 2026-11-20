@@ -913,6 +913,15 @@ pub async fn stat_collector(
 mod tests {
     use super::*;
 
+    pub(crate) fn bind_stale_socket(path: &std::path::Path) {
+        // A concurrent fork can inherit the socket. Bind without listening
+        // so a connection is refused even while the child holds its copy.
+        tokio::net::UnixSocket::new_stream()
+            .expect("socket")
+            .bind(path)
+            .expect("bind");
+    }
+
     #[tokio::test]
     async fn test_join_next_bounded_continues_after_panic() {
         let mut pending = (0..4).map(|unit| async move {

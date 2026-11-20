@@ -1033,8 +1033,7 @@ mod tests {
             .await
             .expect("write reply");
         });
-        // A socket file nobody listens on: connect is refused
-        drop(std::os::unix::net::UnixListener::bind(dir.path().join("io.example.Dead")).unwrap());
+        crate::tests::bind_stale_socket(&dir.path().join("io.example.Dead"));
 
         let stats =
             collect_report_stats(dir.path(), &ReportConfig::default(), Duration::from_secs(5))
@@ -1249,7 +1248,7 @@ junk"#,
         );
         let mut config = command_config(command);
         // Names clash case-insensitively; even a dead admitted socket wins.
-        drop(std::os::unix::net::UnixListener::bind(dir.path().join("com.example.Check")).unwrap());
+        crate::tests::bind_stale_socket(&dir.path().join("com.example.Check"));
         let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
             .await
             .unwrap();
