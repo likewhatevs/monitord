@@ -1391,6 +1391,17 @@ junk"#,
     }
 
     #[cfg(target_os = "linux")]
+    async fn reap_command_leader(pid: libc::pid_t) {
+        use rustix::process::{waitpid, Pid, WaitOptions};
+
+        let leader = Pid::from_raw(pid).unwrap();
+        wait_for_process_event("external reaper did not reap the leader", || {
+            waitpid(Some(leader), WaitOptions::NOHANG).unwrap()
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
     async fn wait_for_process_state(pid: u32, gone: bool) {
         wait_for_process_event("command process did not exit/reap before deadline", || {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
@@ -1515,12 +1526,7 @@ printf 7"#,
         assert_eq!(leader, ids[0] as libc::pid_t);
 
         // Keep a live group member so an erroneous group kill is observable.
-        wait_for_process_event("external reaper did not reap the leader", || {
-            let reaped = unsafe { libc::waitpid(leader, std::ptr::null_mut(), libc::WNOHANG) };
-            assert!(reaped >= 0, "{}", std::io::Error::last_os_error());
-            (reaped == leader).then_some(())
-        })
-        .await;
+        reap_command_leader(leader).await;
         resume.send(()).unwrap();
         let error = finish_command(task).await.unwrap_err();
         assert_eq!(
@@ -1574,12 +1580,7 @@ printf 7"#,
             stat.rsplit_once(") ")?.1.starts_with("T ").then_some(())
         })
         .await;
-        wait_for_process_event("command was not reaped", || {
-            let pid = unsafe { libc::waitpid(leader, std::ptr::null_mut(), libc::WNOHANG) };
-            assert!(pid >= 0);
-            (pid == leader).then_some(())
-        })
-        .await;
+        reap_command_leader(leader).await;
         tokio::time::advance(Duration::from_secs(1)).await;
         let error = finish_command(task).await.unwrap_err();
         assert_eq!(

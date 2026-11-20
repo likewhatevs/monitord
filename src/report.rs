@@ -17,8 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +25,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{self, FuturesUnordered};
 use futures_util::StreamExt;
+use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+use rustix::net::sockopt::{socket_acceptconn, socket_domain, socket_type};
+use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde::{Deserialize, Serialize};
+use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use zlink::connection::socket::{ReadHalf as ZlinkReadHalf, ReadResult, UnixSocket};
@@ -367,90 +370,51 @@ pub unsafe fn take_activation_fd() -> anyhow::Result<Option<OwnedFd>> {
         count == 1,
         "expected exactly one activation fd, got {count}"
     );
-    validate_listener(SD_LISTEN_FDS_START)?;
-    set_cloexec(SD_LISTEN_FDS_START)?;
+    // Activation metadata can name a closed fd. Check before borrowing it.
+    if unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd 3 is open and the caller guarantees exclusive access.
+    let fd = unsafe { BorrowedFd::borrow_raw(SD_LISTEN_FDS_START) };
+    validate_listener(fd)?;
+    set_cloexec(fd)?;
     // SAFETY: validation proved fd 3 is open; the caller guarantees sole ownership.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) }))
 }
 
-fn set_cloexec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+fn set_cloexec(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    Ok(fcntl_setfd(fd, fcntl_getfd(fd)? | FdFlags::CLOEXEC)?)
 }
 
-fn validate_listener(fd: std::os::fd::RawFd) -> anyhow::Result<()> {
-    for (option, expected, description) in [
-        (libc::SO_DOMAIN, libc::AF_UNIX, "Unix domain"),
-        (libc::SO_TYPE, libc::SOCK_STREAM, "stream"),
-        (libc::SO_ACCEPTCONN, 1, "listening"),
-    ] {
-        let mut value: libc::c_int = 0;
-        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-        // SAFETY: value and len point to writable storage of the expected size.
-        if unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                (&mut value as *mut libc::c_int).cast(),
-                &mut len,
-            )
-        } < 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        anyhow::ensure!(
-            value == expected,
-            "report fd must be a listening Unix stream socket (not {description})"
-        );
-    }
+fn validate_listener(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        socket_domain(fd).map_err(std::io::Error::from)? == AddressFamily::UNIX,
+        "report fd must be a listening Unix stream socket (not Unix domain)"
+    );
+    anyhow::ensure!(
+        socket_type(fd).map_err(std::io::Error::from)? == SocketType::STREAM,
+        "report fd must be a listening Unix stream socket (not stream)"
+    );
+    anyhow::ensure!(
+        socket_acceptconn(fd).map_err(std::io::Error::from)?,
+        "report fd must be a listening Unix stream socket (not listening)"
+    );
     Ok(())
 }
 
 /// Probe a Unix socket without blocking when its accept queue is full.
 fn probe_socket(path: &Path) -> std::io::Result<()> {
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: socket returned a new descriptor, owned only here.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: an all-zero sockaddr_un is valid before filling its fields.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid Unix socket path",
-        ));
-    }
-    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *byte as libc::c_char;
-    }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    // SAFETY: address is initialized and len includes its NUL-terminated path.
-    let result = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            (&address as *const libc::sockaddr_un).cast(),
-            len as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    let fd = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // Require room for the trailing NUL. rustix also accepts a full-width path.
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid Unix socket path")
+    })?;
+    connect(&fd, &SocketAddrUnix::new(path)?).map_err(Into::into)
 }
 
 /// Bind `path`, replacing a socket file only if nobody is serving on it.
@@ -458,8 +422,14 @@ fn probe_socket(path: &Path) -> std::io::Result<()> {
 /// Only probe after `AddrInUse`. A refused connection means the socket is
 /// stale; a successful connection or a full accept queue means it is live.
 /// Anything that isn't a socket is left alone.
-fn bind_unless_served(path: &Path) -> anyhow::Result<zlink::tokio::unix::Listener> {
-    match zlink::tokio::unix::bind(path) {
+fn bind_unless_served(path: &Path) -> anyhow::Result<UnixListener> {
+    let bind = || -> zlink::Result<UnixListener> {
+        let listener = UnixListener::bind(path)?;
+        #[cfg(target_os = "linux")]
+        zlink::unix_utils::tag_listener(&listener, Some(path));
+        Ok(listener)
+    };
+    match bind() {
         Ok(listener) => return Ok(listener),
         Err(zlink::Error::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse => {}
         Err(e) => return Err(e.into()),
@@ -483,7 +453,7 @@ fn bind_unless_served(path: &Path) -> anyhow::Result<zlink::tokio::unix::Listene
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             debug!("Replacing stale {}", path.display());
             std::fs::remove_file(path)?;
-            Ok(zlink::tokio::unix::bind(path)?)
+            Ok(bind()?)
         }
         Err(e) => Err(anyhow::anyhow!(
             "Unable to tell whether {} is in use: {e}",
@@ -547,16 +517,21 @@ impl Drop for SocketCleanup {
 fn listener(
     spec: ReportListener,
     cleanup: &mut Option<SocketCleanup>,
-    #[cfg(test)] set_cloexec_override: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
-) -> anyhow::Result<ReportListeningSocket> {
+    #[cfg(test)] set_cloexec_override: Option<fn(BorrowedFd<'_>) -> std::io::Result<()>>,
+) -> anyhow::Result<UnixListener> {
     #[cfg(test)]
     let set_cloexec = set_cloexec_override.unwrap_or(set_cloexec);
     match spec {
         ReportListener::Prebound(fd) => {
-            validate_listener(fd.as_raw_fd())?;
-            set_cloexec(fd.as_raw_fd())?;
+            validate_listener(fd.as_fd())?;
+            set_cloexec(fd.as_fd())?;
             info!("Serving {REPORT_SOCKET_NAME} metrics on a prebound fd");
-            tokio_listener(zlink::tokio::unix::Listener::try_from(fd)?)
+            let listener = std::os::unix::net::UnixListener::from(fd);
+            listener.set_nonblocking(true).map_err(zlink::Error::Io)?;
+            let listener = UnixListener::from_std(listener).map_err(zlink::Error::Io)?;
+            #[cfg(target_os = "linux")]
+            zlink::unix_utils::tag_listener(&listener, None);
+            Ok(listener)
         }
         ReportListener::SelfBind(dir) => {
             anyhow::ensure!(dir.is_absolute(), "report directory must be absolute");
@@ -573,47 +548,9 @@ fn listener(
             // matching systemd's metric source sockets (SocketMode=0666).
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
             info!("Serving {REPORT_SOCKET_NAME} metrics on {}", path.display());
-            tokio_listener(listener)
+            Ok(listener)
         }
     }
-}
-
-/// Keep the original descriptor open while serving through a clone. Prebound
-/// descriptors retain their identity and zlink's listener tags stay in place.
-struct ReportListeningSocket {
-    accepts: tokio::net::UnixListener,
-    _tagged: zlink::tokio::unix::Listener,
-    #[cfg(test)]
-    fail_accept: Option<tokio::sync::oneshot::Receiver<()>>,
-}
-
-impl ReportListeningSocket {
-    async fn accept(
-        &mut self,
-    ) -> std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)> {
-        #[cfg(test)]
-        if let Some(fail) = self.fail_accept.as_mut() {
-            tokio::select! {
-                accepted = self.accepts.accept() => return accepted,
-                _ = fail => {}
-            }
-            self.fail_accept = None;
-            return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
-        }
-        self.accepts.accept().await
-    }
-}
-
-fn tokio_listener(listener: zlink::tokio::unix::Listener) -> anyhow::Result<ReportListeningSocket> {
-    let fd = listener.as_fd().try_clone_to_owned()?;
-    let std_listener = std::os::unix::net::UnixListener::from(fd);
-    std_listener.set_nonblocking(true)?;
-    Ok(ReportListeningSocket {
-        accepts: tokio::net::UnixListener::from_std(std_listener)?,
-        _tagged: listener,
-        #[cfg(test)]
-        fail_accept: None,
-    })
 }
 
 /// No report method accepts file descriptors. Keep each request frame small
@@ -716,20 +653,19 @@ impl ZlinkReadHalf for ReportReadHalf {
 }
 
 async fn serve(
-    mut listener: ReportListeningSocket,
+    listener: UnixListener,
     stats: Arc<RwLock<MonitordStats>>,
     max_connections: usize,
     per_uid_limit: usize,
-    #[cfg(test)] fail_accept: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)] mut fail_accept: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)] mut accept_error_handled: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
-    #[cfg(test)]
-    {
-        listener.fail_accept = fail_accept;
-    }
     let mut clients = FuturesUnordered::new();
     let mut clients_by_uid = BTreeMap::<u32, usize>::new();
     loop {
+        let accept = listener.accept();
+        #[cfg(test)]
+        let accept = tests::inject_accept_error(accept, &mut fail_accept);
         tokio::select! {
             biased;
             Some((uid, result)) = clients.next(), if !clients.is_empty() => {
@@ -740,7 +676,7 @@ async fn serve(
                 }
                 result?;
             }
-            accepted = listener.accept(), if clients.len() < max_connections => {
+            accepted = accept, if clients.len() < max_connections => {
                 let (stream, _) = match accepted {
                     Ok(connection) => connection,
                     Err(error)
@@ -786,7 +722,7 @@ async fn serve(
 #[cfg(test)]
 #[derive(Default)]
 struct ServerHooks {
-    set_cloexec: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
+    set_cloexec: Option<fn(BorrowedFd<'_>) -> std::io::Result<()>>,
     bound: Option<tokio::sync::oneshot::Sender<()>>,
     before_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     ready_sent: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1004,7 +940,23 @@ mod tests {
     use crate::varlink::metrics::{Metrics, MetricsError};
     use futures_util::StreamExt;
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use zlink::tokio::unix::Connection;
+
+    pub(super) async fn inject_accept_error<T>(
+        accept: impl std::future::Future<Output = std::io::Result<T>>,
+        fail_accept: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> std::io::Result<T> {
+        if let Some(fail) = fail_accept.as_mut() {
+            tokio::select! {
+                accepted = accept => return accepted,
+                _ = fail => {}
+            }
+            *fail_accept = None;
+            return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        accept.await
+    }
 
     /// Port of systemd's `varlink_idl_interface_name_is_valid`: dot
     /// separated labels of ASCII letters, digits and `-`, each starting
@@ -1207,6 +1159,16 @@ mod tests {
         // The first listener's socket file is still there and still answers.
         std::os::unix::net::UnixStream::connect(dir.path().join(REPORT_SOCKET_NAME))
             .expect("original listener still reachable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_probe_rejects_invalid_socket_paths() {
+        // A Linux pathname socket needs room for the NUL in its 108-byte sun_path.
+        for path in ["x".repeat(108), "x\0y".into()] {
+            let error = probe_socket(Path::new(&path)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
@@ -1533,6 +1495,12 @@ mod tests {
         ))
         .await
         .unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            crate::tests::socket_fd_count(&owner),
+            2,
+            "one fd each for owner and server"
+        );
         let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
         assert!(flags >= 0);
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
@@ -1542,6 +1510,8 @@ mod tests {
         );
         deadline(round_trip_client(&socket)).await;
         deadline(server.shutdown()).await.unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(crate::tests::socket_fd_count(&owner), 1);
         assert!(socket.exists());
         // A surviving pathname alone would miss shutdown(2) on the shared
         // open file. Prove the original owner's listener can accept again.
