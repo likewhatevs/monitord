@@ -417,155 +417,18 @@ mod tests {
 
     #[test]
     fn test_is_unit_unhealthy_all_combinations() {
-        // Test loaded state with all active states
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::active,
-            SystemdUnitLoadState::loaded
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::reloading,
-            SystemdUnitLoadState::loaded
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::inactive,
-            SystemdUnitLoadState::loaded
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::failed,
-            SystemdUnitLoadState::loaded
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::activating,
-            SystemdUnitLoadState::loaded
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::deactivating,
-            SystemdUnitLoadState::loaded
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::unknown,
-            SystemdUnitLoadState::loaded
-        ));
-
-        // Test masked state with all active states (always healthy)
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::active,
-            SystemdUnitLoadState::masked
-        ));
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::reloading,
-            SystemdUnitLoadState::masked
-        ));
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::inactive,
-            SystemdUnitLoadState::masked
-        ));
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::failed,
-            SystemdUnitLoadState::masked
-        ));
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::activating,
-            SystemdUnitLoadState::masked
-        ));
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::deactivating,
-            SystemdUnitLoadState::masked
-        ));
-        assert!(!is_unit_unhealthy(
-            SystemdUnitActiveState::unknown,
-            SystemdUnitLoadState::masked
-        ));
-
-        // Test error state with all active states (always unhealthy)
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::active,
-            SystemdUnitLoadState::error
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::reloading,
-            SystemdUnitLoadState::error
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::inactive,
-            SystemdUnitLoadState::error
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::failed,
-            SystemdUnitLoadState::error
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::activating,
-            SystemdUnitLoadState::error
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::deactivating,
-            SystemdUnitLoadState::error
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::unknown,
-            SystemdUnitLoadState::error
-        ));
-
-        // Test not_found state with all active states (always unhealthy)
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::active,
-            SystemdUnitLoadState::not_found
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::reloading,
-            SystemdUnitLoadState::not_found
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::inactive,
-            SystemdUnitLoadState::not_found
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::failed,
-            SystemdUnitLoadState::not_found
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::activating,
-            SystemdUnitLoadState::not_found
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::deactivating,
-            SystemdUnitLoadState::not_found
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::unknown,
-            SystemdUnitLoadState::not_found
-        ));
-
-        // Test unknown state with all active states (always unhealthy)
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::active,
-            SystemdUnitLoadState::unknown
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::reloading,
-            SystemdUnitLoadState::unknown
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::inactive,
-            SystemdUnitLoadState::unknown
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::failed,
-            SystemdUnitLoadState::unknown
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::activating,
-            SystemdUnitLoadState::unknown
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::deactivating,
-            SystemdUnitLoadState::unknown
-        ));
-        assert!(is_unit_unhealthy(
-            SystemdUnitActiveState::unknown,
-            SystemdUnitLoadState::unknown
-        ));
+        for load in SystemdUnitLoadState::iter() {
+            for active_state in SystemdUnitActiveState::iter() {
+                let healthy = load == SystemdUnitLoadState::masked
+                    || (load == SystemdUnitLoadState::loaded
+                        && active_state == SystemdUnitActiveState::active);
+                assert_eq!(
+                    is_unit_unhealthy(active_state, load),
+                    !healthy,
+                    "{active_state}/{load}"
+                );
+            }
+        }
     }
 
     #[test]
