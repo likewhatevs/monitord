@@ -128,13 +128,20 @@ pub async fn get_boot_blame_stats(
     config: &BootBlameConfig,
 ) -> anyhow::Result<BootBlameStats> {
     let metrics = crate::varlink_units::collect_metrics(socket_path.into()).await?;
-    if !has_activation_metrics(&metrics) {
+    parse_boot_blame(&metrics, config)
+}
+
+pub(crate) fn parse_boot_blame(
+    metrics: &[ListOutput],
+    config: &BootBlameConfig,
+) -> anyhow::Result<BootBlameStats> {
+    if !has_activation_metrics(metrics) {
         anyhow::bail!(
             "metrics carry no ActiveTimestamp family: this systemd is older than v261, \
              where the per-unit boot timestamps were added"
         );
     }
-    let activations = collect_activations(&metrics, config);
+    let activations = collect_activations(metrics, config);
     Ok(rank_slowest(activations, config.num_slowest_units as usize))
 }
 

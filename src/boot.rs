@@ -231,7 +231,7 @@ pub(crate) async fn update_boot_blame_stats(
     dbus: crate::DbusCell,
     dbus_timeout: u64,
     machine_stats: Arc<RwLock<MachineStats>>,
-    no_fallback: bool,
+    metrics: Option<crate::varlink_units::SharedMetrics>,
 ) -> Result<()> {
     debug!("Starting boot blame stats collection");
 
@@ -239,8 +239,7 @@ pub(crate) async fn update_boot_blame_stats(
     if config.boot_blame.cache_enabled {
         // In-memory hit: the collecting run already recorded which transport
         // produced these stats, so the gauge is intact — keep it.
-        let cached_stats = machine_stats.read().await.boot_blame.clone();
-        if cached_stats.is_some() {
+        if machine_stats.read().await.boot_blame.is_some() {
             debug!("Using in-memory cached boot blame stats");
             return Ok(());
         }
@@ -277,7 +276,7 @@ pub(crate) async fn update_boot_blame_stats(
                                     &config,
                                     &dbus,
                                     dbus_timeout,
-                                    no_fallback,
+                                    metrics,
                                     machine_stats,
                                     maybe_boot_id,
                                 )
@@ -308,7 +307,7 @@ pub(crate) async fn update_boot_blame_stats(
         &config,
         &dbus,
         dbus_timeout,
-        no_fallback,
+        metrics,
         machine_stats,
         maybe_boot_id,
     )
@@ -322,24 +321,23 @@ async fn collect_and_cache(
     config: &Arc<Config>,
     dbus: &crate::DbusCell,
     dbus_timeout: u64,
-    no_fallback: bool,
+    metrics: Option<crate::varlink_units::SharedMetrics>,
     machine_stats: Arc<RwLock<MachineStats>>,
     maybe_boot_id: Option<String>,
 ) -> Result<()> {
-    let use_varlink = config.use_varlink(&[config.boot_blame.varlink]);
-    let (boot_blame_stats, transport) = if use_varlink {
-        match crate::varlink_boot::get_boot_blame_stats(
-            crate::varlink_boot::METRICS_SOCKET_PATH,
-            &config.boot_blame,
-        )
-        .await
-        {
+    let (boot_blame_stats, transport) = if let Some(metrics) = metrics {
+        let collected = crate::varlink_units::await_metrics(metrics)
+            .await
+            .and_then(|metrics| {
+                crate::varlink_boot::parse_boot_blame(&metrics, &config.boot_blame)
+            });
+        match collected {
             Ok(stats) => (stats, crate::CollectorTransport::Varlink),
             Err(err) => {
                 // Plain `?`: NoFallbackError already renders the full
                 // explanation via Display; `{:?}` would dump the struct.
                 crate::varlink_fallback::report_varlink_failure(
-                    no_fallback,
+                    config.varlink.no_fallback,
                     "boot blame",
                     "D-Bus",
                     err,

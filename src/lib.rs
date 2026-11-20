@@ -469,7 +469,7 @@ pub async fn stat_collector(
             )
         });
 
-        // Likewise one io.systemd.Metrics.List per cycle: units and verify both
+        // Likewise one io.systemd.Metrics.List per cycle: units, boot blame and verify
         // read it, and a second stream would make PID 1 walk every unit again.
         // Lazy, so a cycle served entirely over D-Bus sends nothing.
         let manager_metrics =
@@ -714,6 +714,9 @@ pub async fn stat_collector(
         // they take the shared cell and resolve it only on a D-Bus code
         // path, so a varlink success or cache hit never connects.
         if config.boot_blame.enabled {
+            let metrics = config
+                .use_varlink(&[config.boot_blame.varlink])
+                .then(|| manager_metrics.clone());
             let dbus_cell = dbus_cell.clone();
             let config_clone = Arc::clone(&config);
             let stats_clone = locked_machine_stats.clone();
@@ -722,13 +725,12 @@ pub async fn stat_collector(
                 "boot_blame",
                 collect_start_time,
                 async move {
-                    let no_fallback = config_clone.varlink.no_fallback;
                     crate::boot::update_boot_blame_stats(
                         config_clone,
                         dbus_cell,
                         dbus_timeout,
                         stats_clone,
-                        no_fallback,
+                        metrics,
                     )
                     .await
                 },
