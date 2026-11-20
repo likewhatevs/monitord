@@ -6,6 +6,8 @@ use std::str::FromStr;
 use configparser::ini::Ini;
 use indexmap::map::IndexMap;
 use int_enum::IntEnum;
+use smart_default::SmartDefault;
+use struct_field_names_as_array::FieldNamesAsSlice;
 use strum_macros::EnumString;
 use thiserror::Error;
 use tracing::{error, warn};
@@ -42,146 +44,108 @@ pub enum MonitordOutputFormat {
     JsonPretty = 2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct MonitordConfig {
+    #[default(crate::DEFAULT_DBUS_ADDRESS.into())]
     pub dbus_address: String,
     pub daemon: bool,
+    #[default = 30]
     pub daemon_stats_refresh_secs: u64,
     pub key_prefix: String,
     pub output_format: MonitordOutputFormat,
+    #[default = 30]
     pub dbus_timeout: u64,
 }
-impl Default for MonitordConfig {
-    fn default() -> Self {
-        MonitordConfig {
-            dbus_address: crate::DEFAULT_DBUS_ADDRESS.into(),
-            daemon: false,
-            daemon_stats_refresh_secs: 30,
-            key_prefix: "".to_string(),
-            output_format: MonitordOutputFormat::default(),
-            dbus_timeout: 30,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct NetworkdConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus/files while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
+    #[default(crate::networkd::NETWORKD_STATE_FILES.into())]
     pub link_state_dir: PathBuf,
 }
-impl Default for NetworkdConfig {
-    fn default() -> Self {
-        NetworkdConfig {
-            enabled: false,
-            varlink: true,
-            link_state_dir: crate::networkd::NETWORKD_STATE_FILES.into(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct Pid1Config {
+    #[default = true]
     pub enabled: bool,
 }
-impl Default for Pid1Config {
-    fn default() -> Self {
-        Pid1Config { enabled: true }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct SystemStateConfig {
+    #[default = true]
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink. Also gates the always-on
     /// systemd version collection, which shares the `Manager.Describe` call.
+    #[default = true]
     pub varlink: bool,
 }
-impl Default for SystemStateConfig {
-    fn default() -> Self {
-        SystemStateConfig {
-            enabled: true,
-            varlink: true,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct TimersConfig {
+    #[default = true]
     pub enabled: bool,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
-impl Default for TimersConfig {
-    fn default() -> Self {
-        TimersConfig {
-            enabled: true,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct UnitsConfig {
+    #[default = true]
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
     /// Unit-name patterns for failed counts, keyed by family. Each pattern
     /// matches a full name or contains one `*` matching a non-empty string.
+    #[field_names_as_slice(skip)]
     pub failed_families: BTreeMap<String, String>,
     pub state_stats: bool,
+    #[field_names_as_slice(skip)]
     pub state_stats_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub state_stats_blocklist: HashSet<String>,
+    #[default = true]
     pub state_stats_time_in_state: bool,
     /// Host unit names mapped to their health grace period from boot, in seconds.
+    #[field_names_as_slice(skip)]
     pub boot_grace: BTreeMap<String, u64>,
+    #[default = true]
     pub ignore_inactive_oneshot_services: bool,
+    #[default = true]
     pub unit_files: bool,
     /// Max number of units whose D-Bus work runs concurrently in the per-unit
     /// collection loop. Bounded (rather than unbounded) so a burst of
     /// simultaneous D-Bus calls doesn't itself worsen host-level IPC
     /// contention on hosts where per-call latency is already elevated.
+    #[default = 8]
     pub per_unit_concurrency: u64,
     /// Number of slowest units (by per-unit collection duration) to record in
     /// `UnitsCollectionTimings::slowest_units`. Set to 0 to disable.
+    #[default = 5]
     pub slowest_units_count: u64,
     /// Varlink path only: the longest, in seconds, a `[services]` entry's
     /// `io.systemd.Unit.List` reply is reused across cycles. Entries are
     /// refetched sooner when the unit changes state or the manager reloads;
     /// this bounds fields that can change without either (e.g. a runtime
     /// `WATCHDOG_USEC=` notify). 0 disables the cache.
+    #[default = 300]
     pub service_details_cache_max_age_secs: u64,
 }
-impl Default for UnitsConfig {
-    fn default() -> Self {
-        UnitsConfig {
-            enabled: true,
-            varlink: true,
-            failed_families: BTreeMap::new(),
-            state_stats: false,
-            state_stats_allowlist: HashSet::new(),
-            state_stats_blocklist: HashSet::new(),
-            state_stats_time_in_state: true,
-            boot_grace: BTreeMap::new(),
-            ignore_inactive_oneshot_services: true,
-            unit_files: true,
-            per_unit_concurrency: 8,
-            slowest_units_count: 5,
-            service_details_cache_max_age_secs: 300,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct MachinesConfig {
+    #[default = true]
     pub enabled: bool,
     /// Use varlink APIs inside containers when the global `[varlink]`
     /// switch is on. Default true: set false to keep all container
@@ -189,116 +153,82 @@ pub struct MachinesConfig {
     /// matching collector section's own `varlink` toggle. Container varlink
     /// connects from inside the container's PID namespace (see
     /// `crate::varlink::machine_connector`), which needs `CAP_SYS_ADMIN`.
+    #[default = true]
     pub varlink: bool,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
-impl Default for MachinesConfig {
-    fn default() -> Self {
-        MachinesConfig {
-            enabled: true,
-            varlink: true,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct DBusStatsConfig {
+    #[default = true]
     pub enabled: bool,
+    #[default = true]
     pub stale_fd_stats: bool,
 
     pub user_stats: bool,
+    #[field_names_as_slice(skip)]
     pub user_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub user_blocklist: HashSet<String>,
 
     pub peer_stats: bool,
     pub peer_well_known_names_only: bool,
+    #[field_names_as_slice(skip)]
     pub peer_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub peer_blocklist: HashSet<String>,
     /// Max number of well-known bus names whose owner lookup runs concurrently
     /// when resolving peer names. Bounded (rather than unbounded) for the same
     /// reason as `UnitsConfig::per_unit_concurrency`: a burst of simultaneous
     /// D-Bus calls can itself worsen host-level IPC contention.
+    #[default = 8]
     pub peer_name_concurrency: u64,
 
     pub cgroup_stats: bool,
+    #[field_names_as_slice(skip)]
     pub cgroup_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub cgroup_blocklist: HashSet<String>,
 }
-impl Default for DBusStatsConfig {
-    fn default() -> Self {
-        DBusStatsConfig {
-            enabled: true,
-            stale_fd_stats: true,
 
-            user_stats: false,
-            user_allowlist: HashSet::new(),
-            user_blocklist: HashSet::new(),
-
-            peer_stats: false,
-            peer_well_known_names_only: false,
-            peer_allowlist: HashSet::new(),
-            peer_blocklist: HashSet::new(),
-            peer_name_concurrency: 8,
-
-            cgroup_stats: false,
-            cgroup_allowlist: HashSet::new(),
-            cgroup_blocklist: HashSet::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct BootBlameConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
+    #[default = true]
     pub cache_enabled: bool,
+    #[default = "/run/monitord"]
     pub cache_dir: String,
+    #[default = 5]
     pub num_slowest_units: u64,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
-impl Default for BootBlameConfig {
-    fn default() -> Self {
-        BootBlameConfig {
-            enabled: false,
-            varlink: true,
-            cache_enabled: true,
-            cache_dir: "/run/monitord".to_string(),
-            num_slowest_units: 5,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct VerifyConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
-impl Default for VerifyConfig {
-    fn default() -> Self {
-        VerifyConfig {
-            enabled: false,
-            varlink: true,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, FieldNamesAsSlice, PartialEq)]
 pub struct VarlinkConfig {
     /// Global varlink master switch. Each varlink-capable collector section
     /// has its own `varlink` opt-out; a collector uses varlink only when
@@ -332,7 +262,7 @@ pub struct ReportCommand {
 /// `systemd-report` over `io.systemd.Metrics` (see `crate::report`), and
 /// collect other systemd-report sources (`/run/systemd/report/*`, systemd
 /// v260+) and configured commands (see `crate::report_collector`).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, FieldNamesAsSlice, PartialEq)]
 pub struct ReportConfig {
     /// Serve `io.systemd.Metrics` on `/run/systemd/report/io.monitord`
     /// (or a socket-activated fd). Off by default. The binary serves only
@@ -345,8 +275,10 @@ pub struct ReportConfig {
     pub collect: bool,
     /// Only collect these socket sources (e.g. `io.systemd.Basic`).
     /// Lowercased by the INI parser, so matched case-insensitively.
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
     /// Never collect these socket sources. Matched case-insensitively.
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
     /// Never collect these metrics, from any source: full metric names
     /// (e.g. `io.systemd.Basic.MachineID`), each also matching every name
@@ -354,9 +286,11 @@ pub struct ReportConfig {
     /// `io.systemd.Basic.SMBIOS.SystemVendor`). Lowercased by the INI
     /// parser, so matched case-insensitively. The example monitord.conf
     /// lists host identifiers here; see the README for why.
+    #[field_names_as_slice(skip)]
     pub metric_blocklist: HashSet<String>,
     /// Explicit command sources, keyed by lowercased interface name. Socket
     /// source filters do not apply to these opt-in sources.
+    #[field_names_as_slice(skip)]
     pub commands: BTreeMap<String, ReportCommand>,
 }
 
@@ -422,6 +356,13 @@ impl TryFrom<Ini> for Config {
 
     fn try_from(ini_config: Ini) -> Result<Self, MonitordConfigError> {
         let mut config = Config::default();
+        let config_map = ini_config.get_map_ref();
+        let section_keys = |section: &str| {
+            config_map
+                .get(section)
+                .map(|entries| entries.keys().cloned().collect())
+                .unwrap_or_default()
+        };
 
         // [monitord] section
         if let Some(dbus_address) = ini_config.get("monitord", "dbus_address") {
@@ -465,10 +406,7 @@ impl TryFrom<Ini> for Config {
         config.pid1.enabled = read_config_bool(&ini_config, "pid1", "enabled")?;
 
         // [services] section
-        let config_map = ini_config.get_map().unwrap_or(IndexMap::from([]));
-        if let Some(services) = config_map.get("services") {
-            config.services = services.keys().map(|s| s.to_string()).collect();
-        }
+        config.services = section_keys("services");
 
         // [system-state] section
         config.system_state.enabled = read_config_bool(&ini_config, "system-state", "enabled")?;
@@ -478,12 +416,8 @@ impl TryFrom<Ini> for Config {
 
         // [timers] section
         config.timers.enabled = read_config_bool(&ini_config, "timers", "enabled")?;
-        if let Some(timers_allowlist) = config_map.get("timers.allowlist") {
-            config.timers.allowlist = timers_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(timers_blocklist) = config_map.get("timers.blocklist") {
-            config.timers.blocklist = timers_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.timers.allowlist = section_keys("timers.allowlist");
+        config.timers.blocklist = section_keys("timers.blocklist");
 
         // [units] section
         config.units.enabled = read_config_bool(&ini_config, "units", "enabled")?;
@@ -507,18 +441,8 @@ impl TryFrom<Ini> for Config {
             }
         }
         config.units.state_stats = read_config_bool(&ini_config, "units", "state_stats")?;
-        if let Some(state_stats_allowlist) = config_map.get("units.state_stats.allowlist") {
-            config.units.state_stats_allowlist = state_stats_allowlist
-                .keys()
-                .map(|s| s.to_string())
-                .collect();
-        }
-        if let Some(state_stats_blocklist) = config_map.get("units.state_stats.blocklist") {
-            config.units.state_stats_blocklist = state_stats_blocklist
-                .keys()
-                .map(|s| s.to_string())
-                .collect();
-        }
+        config.units.state_stats_allowlist = section_keys("units.state_stats.allowlist");
+        config.units.state_stats_blocklist = section_keys("units.state_stats.blocklist");
         if let Some(entries) = config_map.get("units.state_stats.boot_grace") {
             for (label, value) in entries {
                 let invalid = || MonitordConfigError::InvalidValue {
@@ -569,12 +493,8 @@ impl TryFrom<Ini> for Config {
         if let Some(varlink) = read_config_optional_bool(&ini_config, "machines", "varlink")? {
             config.machines.varlink = varlink;
         }
-        if let Some(machines_allowlist) = config_map.get("machines.allowlist") {
-            config.machines.allowlist = machines_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(machines_blocklist) = config_map.get("machines.blocklist") {
-            config.machines.blocklist = machines_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.machines.allowlist = section_keys("machines.allowlist");
+        config.machines.blocklist = section_keys("machines.blocklist");
 
         // [dbus] section
         config.dbus_stats.enabled = read_config_bool(&ini_config, "dbus", "enabled")?;
@@ -585,40 +505,22 @@ impl TryFrom<Ini> for Config {
         }
 
         config.dbus_stats.user_stats = read_config_bool(&ini_config, "dbus", "user_stats")?;
-        if let Some(user_allowlist) = config_map.get("dbus.user.allowlist") {
-            config.dbus_stats.user_allowlist =
-                user_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(user_blocklist) = config_map.get("dbus.user.blocklist") {
-            config.dbus_stats.user_blocklist =
-                user_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.dbus_stats.user_allowlist = section_keys("dbus.user.allowlist");
+        config.dbus_stats.user_blocklist = section_keys("dbus.user.blocklist");
 
         config.dbus_stats.peer_stats = read_config_bool(&ini_config, "dbus", "peer_stats")?;
         config.dbus_stats.peer_well_known_names_only =
             read_config_bool(&ini_config, "dbus", "peer_well_known_names_only")?;
-        if let Some(peer_allowlist) = config_map.get("dbus.peer.allowlist") {
-            config.dbus_stats.peer_allowlist =
-                peer_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(peer_blocklist) = config_map.get("dbus.peer.blocklist") {
-            config.dbus_stats.peer_blocklist =
-                peer_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.dbus_stats.peer_allowlist = section_keys("dbus.peer.allowlist");
+        config.dbus_stats.peer_blocklist = section_keys("dbus.peer.blocklist");
         if let Ok(Some(peer_name_concurrency)) = ini_config.getuint("dbus", "peer_name_concurrency")
         {
             config.dbus_stats.peer_name_concurrency = peer_name_concurrency;
         }
 
         config.dbus_stats.cgroup_stats = read_config_bool(&ini_config, "dbus", "cgroup_stats")?;
-        if let Some(cgroup_allowlist) = config_map.get("dbus.cgroup.allowlist") {
-            config.dbus_stats.cgroup_allowlist =
-                cgroup_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(cgroup_blocklist) = config_map.get("dbus.cgroup.blocklist") {
-            config.dbus_stats.cgroup_blocklist =
-                cgroup_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.dbus_stats.cgroup_allowlist = section_keys("dbus.cgroup.allowlist");
+        config.dbus_stats.cgroup_blocklist = section_keys("dbus.cgroup.blocklist");
 
         // [boot] section
         config.boot_blame.enabled = read_config_bool(&ini_config, "boot", "enabled")?;
@@ -636,24 +538,16 @@ impl TryFrom<Ini> for Config {
         if let Ok(Some(num_slowest_units)) = ini_config.getuint("boot", "num_slowest_units") {
             config.boot_blame.num_slowest_units = num_slowest_units;
         }
-        if let Some(boot_allowlist) = config_map.get("boot.allowlist") {
-            config.boot_blame.allowlist = boot_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(boot_blocklist) = config_map.get("boot.blocklist") {
-            config.boot_blame.blocklist = boot_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.boot_blame.allowlist = section_keys("boot.allowlist");
+        config.boot_blame.blocklist = section_keys("boot.blocklist");
 
         // [verify] section
         config.verify.enabled = read_config_bool(&ini_config, "verify", "enabled")?;
         if let Some(varlink) = read_config_optional_bool(&ini_config, "verify", "varlink")? {
             config.verify.varlink = varlink;
         }
-        if let Some(verify_allowlist) = config_map.get("verify.allowlist") {
-            config.verify.allowlist = verify_allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(verify_blocklist) = config_map.get("verify.blocklist") {
-            config.verify.blocklist = verify_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.verify.allowlist = section_keys("verify.allowlist");
+        config.verify.blocklist = section_keys("verify.blocklist");
 
         // [varlink] section
         config.varlink.enabled = read_config_bool(&ini_config, "varlink", "enabled")?;
@@ -678,16 +572,9 @@ impl TryFrom<Ini> for Config {
         if let Some(collect) = read_config_optional_bool(&ini_config, "report", "collect")? {
             config.report.collect = collect;
         }
-        if let Some(allowlist) = config_map.get("report.sources.allowlist") {
-            config.report.allowlist = allowlist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(blocklist) = config_map.get("report.sources.blocklist") {
-            config.report.blocklist = blocklist.keys().map(|s| s.to_string()).collect();
-        }
-        if let Some(metric_blocklist) = config_map.get("report.metrics.blocklist") {
-            config.report.metric_blocklist =
-                metric_blocklist.keys().map(|s| s.to_string()).collect();
-        }
+        config.report.allowlist = section_keys("report.sources.allowlist");
+        config.report.blocklist = section_keys("report.sources.blocklist");
+        config.report.metric_blocklist = section_keys("report.metrics.blocklist");
         for (section, format) in [
             ("report.commands", ReportCommandFormat::Records),
             ("report.commands.number", ReportCommandFormat::Number),
@@ -719,7 +606,7 @@ impl TryFrom<Ini> for Config {
             }
         }
 
-        for entry in unknown_config_entries(&config_map) {
+        for entry in unknown_config_entries(config_map) {
             warn!("Ignoring {entry}; check for a typo'd key or section");
         }
 
@@ -727,67 +614,25 @@ impl TryFrom<Ini> for Config {
     }
 }
 
-/// Fixed-key sections and every key monitord reads from each.
+/// Fixed INI keys come from the config fields. Fields loaded from their own
+/// data sections are skipped in the derive.
 ///
 /// Data sections (`[services]`, `*.allowlist`, `*.blocklist`) take arbitrary
 /// entries and are exempt; anything else unknown is warned about so a typo'd
 /// key parses loudly instead of silently doing nothing.
 const KNOWN_SECTION_KEYS: &[(&str, &[&str])] = &[
-    (
-        "monitord",
-        &[
-            "dbus_address",
-            "dbus_timeout",
-            "daemon",
-            "daemon_stats_refresh_secs",
-            "key_prefix",
-            "output_format",
-        ],
-    ),
-    ("networkd", &["enabled", "varlink", "link_state_dir"]),
-    ("pid1", &["enabled"]),
-    ("system-state", &["enabled", "varlink"]),
-    ("timers", &["enabled"]),
-    (
-        "units",
-        &[
-            "enabled",
-            "varlink",
-            "state_stats",
-            "state_stats_time_in_state",
-            "ignore_inactive_oneshot_services",
-            "unit_files",
-            "per_unit_concurrency",
-            "slowest_units_count",
-            "service_details_cache_max_age_secs",
-        ],
-    ),
-    ("machines", &["enabled", "varlink"]),
-    (
-        "dbus",
-        &[
-            "enabled",
-            "stale_fd_stats",
-            "user_stats",
-            "peer_stats",
-            "peer_well_known_names_only",
-            "peer_name_concurrency",
-            "cgroup_stats",
-        ],
-    ),
-    (
-        "boot",
-        &[
-            "enabled",
-            "varlink",
-            "cache_enabled",
-            "cache_dir",
-            "num_slowest_units",
-        ],
-    ),
-    ("verify", &["enabled", "varlink"]),
-    ("varlink", &["enabled", "no_fallback"]),
-    ("report", &["enabled", "collect"]),
+    ("monitord", MonitordConfig::FIELD_NAMES_AS_SLICE),
+    ("networkd", NetworkdConfig::FIELD_NAMES_AS_SLICE),
+    ("pid1", Pid1Config::FIELD_NAMES_AS_SLICE),
+    ("system-state", SystemStateConfig::FIELD_NAMES_AS_SLICE),
+    ("timers", TimersConfig::FIELD_NAMES_AS_SLICE),
+    ("units", UnitsConfig::FIELD_NAMES_AS_SLICE),
+    ("machines", MachinesConfig::FIELD_NAMES_AS_SLICE),
+    ("dbus", DBusStatsConfig::FIELD_NAMES_AS_SLICE),
+    ("boot", BootBlameConfig::FIELD_NAMES_AS_SLICE),
+    ("verify", VerifyConfig::FIELD_NAMES_AS_SLICE),
+    ("varlink", VarlinkConfig::FIELD_NAMES_AS_SLICE),
+    ("report", ReportConfig::FIELD_NAMES_AS_SLICE),
 ];
 
 /// Sections whose entries are data (unit/machine names), not fixed keys.
@@ -1054,15 +899,7 @@ output_format = json-flat
 
     #[test]
     fn test_minimal_config() {
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(MINIMAL_CONFIG.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(MINIMAL_CONFIG);
 
         let expected_config: Config = ini_config.try_into().expect("Failed to parse config");
         // See our one setting is not the default 'json' enum value
@@ -1210,15 +1047,7 @@ output_format = json
 [units]
 ignore_inactive_oneshot_services = false
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(units_override_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(units_override_config);
 
         let parsed_config: Config = ini_config.try_into().expect("Failed to parse config");
         assert!(!parsed_config.units.ignore_inactive_oneshot_services);
@@ -1235,15 +1064,7 @@ per_unit_concurrency = 32
 slowest_units_count = 0
 service_details_cache_max_age_secs = 0
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(units_override_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(units_override_config);
 
         let parsed_config: Config = ini_config.try_into().expect("Failed to parse config");
         assert_eq!(parsed_config.units.per_unit_concurrency, 32);
@@ -1279,6 +1100,10 @@ output_format = json
 
 [units]
 varlnik = false
+failed_families = ignored
+
+[units.failed_families]
+worker = worker@*.service
 
 [timers]
 varlink = false
@@ -1289,21 +1114,14 @@ foo.service
 [bogus]
 key = value
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(typo_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(typo_config);
 
         let unknown = unknown_config_entries(&ini_config.get_map().expect("config map"));
         assert!(unknown.contains(&"unknown key 'varlnik' in [units]".to_string()));
         assert!(unknown.contains(&"unknown key 'varlink' in [timers]".to_string()));
         assert!(unknown.contains(&"unknown section [bogus]".to_string()));
-        assert_eq!(unknown.len(), 3);
+        assert!(unknown.contains(&"unknown key 'failed_families' in [units]".to_string()));
+        assert_eq!(unknown.len(), 4);
     }
 
     #[test]
@@ -1318,10 +1136,7 @@ output_format = json
 enabled = true
 no_fallback = true
 "###;
-        let mut f = NamedTempFile::new().expect("tempfile");
-        f.write_all(on.as_bytes()).expect("write");
-        let mut ini = Ini::new();
-        ini.load(f.path()).expect("load");
+        let ini = load_ini(on);
         let parsed: Config = ini.try_into().expect("parse");
         assert!(parsed.varlink.no_fallback);
 
@@ -1332,10 +1147,7 @@ output_format = json
 [varlink]
 enabled = true
 "###;
-        let mut f = NamedTempFile::new().expect("tempfile");
-        f.write_all(off.as_bytes()).expect("write");
-        let mut ini = Ini::new();
-        ini.load(f.path()).expect("load");
+        let ini = load_ini(off);
         let parsed: Config = ini.try_into().expect("parse");
         assert!(!parsed.varlink.no_fallback);
     }
@@ -1354,15 +1166,7 @@ enabled = true
 [units]
 varlink = false
 "###;
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(varlink_override_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(varlink_override_config);
 
         let parsed_config: Config = ini_config.try_into().expect("Failed to parse config");
         assert!(parsed_config.varlink.enabled);
@@ -1472,15 +1276,7 @@ varlink = false
             },
         };
 
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(FULL_CONFIG.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(FULL_CONFIG);
 
         // See everything set / overloaded ...
         let actual_config: Config = ini_config.try_into().expect("Failed to parse config");
@@ -1490,15 +1286,7 @@ varlink = false
     #[test]
     fn test_invalid_config_returns_error() {
         let invalid_config = "[monitord]\ndaemon = notabool\noutput_format = json\n";
-        let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
-        monitord_config
-            .write_all(invalid_config.as_bytes())
-            .expect("Unable to write out temp config file");
-
-        let mut ini_config = Ini::new();
-        let _config_map = ini_config
-            .load(monitord_config.path())
-            .expect("Unable to load ini config");
+        let ini_config = load_ini(invalid_config);
 
         let result: Result<Config, _> = ini_config.try_into();
         assert!(result.is_err());
