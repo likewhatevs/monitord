@@ -31,7 +31,7 @@ use crate::units::SystemdUnitStats;
 use crate::varlink::metrics::{ListOutput, Metrics};
 use crate::MachineStats;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{StreamExt, TryStreamExt};
 
 pub const METRICS_SOCKET_PATH: &str = "/run/systemd/report/io.systemd.Manager";
 
@@ -299,25 +299,17 @@ pub(crate) async fn collect_metrics(
         rt.block_on(async move {
             let mut conn = endpoint.connect().await?;
             let stream = conn.list().await?;
-            futures_util::pin_mut!(stream);
-
-            let mut metrics = Vec::new();
-            let mut count = 0;
-            while let Some(result) = stream.try_next().await? {
-                let result: std::result::Result<ListOutput, _> = result;
-                match result {
-                    Ok(metric) => {
-                        debug!("Metrics {}: {:?}", count, metric);
-                        count += 1;
-                        metrics.push(metric);
-                    }
-                    Err(e) => {
-                        debug!("Error deserializing metric {}: {:?}", count, e);
-                        return Err(anyhow::anyhow!(e));
-                    }
-                }
-            }
-            Ok(metrics)
+            stream
+                .enumerate()
+                .map(|(index, reply)| {
+                    let metric = reply?.inspect_err(|e| {
+                        debug!("Error deserializing metric {}: {:?}", index, e);
+                    })?;
+                    debug!("Metrics {}: {:?}", index, metric);
+                    Ok(metric)
+                })
+                .try_collect()
+                .await
         })
     })
     .await?
