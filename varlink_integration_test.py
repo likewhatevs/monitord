@@ -1678,6 +1678,88 @@ def diff_outputs(dbus_stats: Stats, varlink_stats: Stats) -> list[str]:
     ]
 
 
+def check_machine_failure_isolation(stats: Stats, log: str) -> None:
+    """Check that each failed collector leaves its own machine's defaults."""
+    pinned = f"monitord.machines.{MACHINE_FIXTURE_NAME}"
+    current = f"monitord.machines.{MACHINE_CURRENT_NAME}"
+    if stats.get(f"{pinned}.system-state") in (None, 0):
+        raise SystemExit("FAIL: pinned machine's Manager.Describe did not succeed")
+    if stats.get(f"{pinned}.varlink_usage.system_state") != 1:
+        raise SystemExit("FAIL: pinned machine's system state was not collected over varlink")
+    if stats.get(f"{current}.units.total_units", 0) <= 0:
+        raise SystemExit("FAIL: current machine's units listing did not succeed")
+    if stats.get(f"{current}.system-state") != 0:
+        raise SystemExit(
+            "FAIL: failed current machine system state inherited another machine's value"
+        )
+    if stats.get(f"{pinned}.units.total_units") != 0:
+        raise SystemExit("FAIL: failed pinned machine units inherited another machine's values")
+    # Positive values above prove both machines were connected and published.
+    # The log also proves the intended collectors ran and hit their failures,
+    # rather than defaults coming from disabled collectors or absent machines.
+    for machine, collector in (
+        (MACHINE_FIXTURE_NAME, "units"),
+        (MACHINE_CURRENT_NAME, "system state"),
+        (MACHINE_CURRENT_NAME, "units"),
+    ):
+        context = f"Collection specific failure (container {machine}):"
+        failure = f"varlink container {machine} {collector} failed and [varlink] no_fallback=true"
+        if not any(context in line and failure in line for line in log.splitlines()):
+            raise SystemExit(f"FAIL: no expected {machine} {collector} collection failure in log")
+
+
+def assert_machine_failure_isolation(container: str) -> None:
+    step("Asserting failed machine collectors cannot inherit another machine's stats")
+
+    def bounded_exec(
+        *args: str, content: Optional[str] = None
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["docker", "exec", *(["-i"] if content is not None else []), container, *args],
+            input=content, capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise SystemExit(f"FAIL: machine isolation command {args!r}: {result.stderr}")
+        return result
+
+    conf = bounded_exec("cat", VARLINK_CONF).stdout
+    original = "[varlink]\nenabled = true\nno_fallback = false"
+    if original not in conf:
+        raise SystemExit("FAIL: machine isolation cannot enable no_fallback in fixture config")
+    conf = conf.replace(original, "[varlink]\nenabled = true\nno_fallback = true")
+    path = "/tmp/monitord-machine-isolation-ci.conf"
+    bounded_exec("tee", path, content=conf)
+    leader = bounded_exec(
+        "machinectl", "show", MACHINE_CURRENT_NAME, "-p", "Leader", "--value"
+    ).stdout.strip()
+    if not leader.isdecimal() or int(leader) <= 1:
+        raise SystemExit(f"FAIL: invalid current machine leader PID {leader!r}")
+    manager = f"/proc/{leader}/root{MANAGER_SOCKET}"
+    parked = manager + ".monitord-test-disabled"
+    # The current fixture has a private /run. Check the inode too, so an
+    # accidental shared mount cannot hide the host manager socket.
+    if bounded_exec("stat", "-Lc", "%d:%i", manager).stdout == bounded_exec(
+        "stat", "-Lc", "%d:%i", MANAGER_SOCKET
+    ).stdout:
+        raise SystemExit("FAIL: fixture machine shares the host manager socket")
+    bounded_exec("test", "-S", manager)
+    bounded_exec("test", "!", "-e", parked)
+    bounded_exec("mv", manager, parked)
+    try:
+        # Pinned systemd lacks the units Metrics endpoint, but its Describe
+        # succeeds. Current systemd publishes its Metrics unit listing before
+        # details fail on the hidden Manager socket; its Describe fails too.
+        # Shared scratch would therefore leak units or system state, regardless
+        # of HashMap iteration order.
+        result = bounded_exec(
+            f"{CONTAINER_TARGET_DIR}/release/monitord", "-c", path, "-l", "debug"
+        )
+        check_machine_failure_isolation(json.loads(result.stdout), result.stderr)
+    finally:
+        bounded_exec("mv", parked, manager)
+    print("PASS: opposite machine collector failures leave fresh defaults in either iteration order")
+
+
 def compare_outputs(dbus_stats: Stats, varlink_stats: Stats) -> None:
     step("Comparing D-Bus and varlink output")
     differences = diff_outputs(dbus_stats, varlink_stats)
@@ -1796,6 +1878,7 @@ def main() -> None:
     assert_cgroup_fixture_values({"varlink": varlink_stats, "dbus": dbus_stats})
     compare_outputs(dbus_stats, varlink_stats)
     assert_machine_fetch_counters(dbus_stats, varlink_stats)
+    assert_machine_failure_isolation(args.container)
     assert_dead_bus_run(args.container)
     assert_capability_matrix(args.container, repo)
     assert_connector_caching(args.container)
