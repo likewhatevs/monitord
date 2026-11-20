@@ -313,37 +313,52 @@ impl MetricsService {
     }
 }
 
-/// Take the first listener that systemd passed to this process.
+/// Take the single listening Unix stream socket passed for this process.
+///
+/// Returns `None` if `LISTEN_PID` is unset or names another process. Malformed
+/// or ambiguous activation is an error. All four `LISTEN_*` variables are
+/// cleared on every path; accepted descriptors are marked close-on-exec.
 ///
 /// # Safety
 ///
 /// Call before any other thread starts: this removes environment variables.
 /// Nothing else in the process may own fd 3. Call at most once.
 pub unsafe fn take_activation_fd() -> anyhow::Result<Option<OwnedFd>> {
-    let pid = std::env::var("LISTEN_PID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok());
-    if pid != Some(std::process::id()) {
-        return Ok(None);
-    }
-    let count = std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
-    for name in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"] {
+    let pid = std::env::var_os("LISTEN_PID");
+    let count = std::env::var_os("LISTEN_FDS");
+    for name in [
+        "LISTEN_PID",
+        "LISTEN_PIDFDID",
+        "LISTEN_FDS",
+        "LISTEN_FDNAMES",
+    ] {
         // SAFETY: the caller guarantees there are no other threads.
         unsafe { std::env::remove_var(name) };
     }
-    if count == 0 {
+    let Some(pid) = pid else {
+        return Ok(None);
+    };
+    let pid: u32 = pid
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid LISTEN_PID"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid LISTEN_PID"))?;
+    if pid != std::process::id() {
         return Ok(None);
     }
-    if count > 1 {
-        warn!(
-            "Socket activation passed {count} fds; using only the first for {REPORT_SOCKET_NAME}"
-        );
-    }
+    let count: u32 = count
+        .as_deref()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid LISTEN_FDS"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid LISTEN_FDS"))?;
+    anyhow::ensure!(
+        count == 1,
+        "expected exactly one activation fd, got {count}"
+    );
+    validate_listener(SD_LISTEN_FDS_START)?;
     set_cloexec(SD_LISTEN_FDS_START)?;
-    // SAFETY: setting close-on-exec proved fd 3 is open; the caller guarantees sole ownership.
+    // SAFETY: validation proved fd 3 is open; the caller guarantees sole ownership.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) }))
 }
 
@@ -521,7 +536,10 @@ impl Drop for SocketCleanup {
 fn listener(
     spec: ReportListener,
     cleanup: &mut Option<SocketCleanup>,
+    #[cfg(test)] set_cloexec_override: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
 ) -> anyhow::Result<zlink::tokio::unix::Listener> {
+    #[cfg(test)]
+    let set_cloexec = set_cloexec_override.unwrap_or(set_cloexec);
     match spec {
         ReportListener::Prebound(fd) => {
             validate_listener(fd.as_raw_fd())?;
@@ -552,6 +570,7 @@ fn listener(
 #[cfg(test)]
 #[derive(Default)]
 struct ServerHooks {
+    set_cloexec: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
     bound: Option<tokio::sync::oneshot::Sender<()>>,
     before_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     ready_sent: Option<tokio::sync::oneshot::Sender<()>>,
@@ -620,6 +639,8 @@ impl ReportServer {
                         let listener = listener(
                             spec,
                             &mut cleanup,
+                            #[cfg(test)]
+                            hooks.set_cloexec,
                         )?;
                         #[cfg(test)]
                         if let Some(bound) = hooks.bound.take() {
@@ -1064,6 +1085,50 @@ mod tests {
             assert!(deadline(readiness).await.is_err(), "readiness was sent");
         }
         assert!(!dir.path().join("missing-directory").exists());
+    }
+
+    #[tokio::test]
+    async fn test_server_prebound_cloexec_failure_precedes_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(REPORT_SOCKET_NAME);
+        let owner = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = std::fs::symlink_metadata(&socket).unwrap();
+        let fd: OwnedFd = owner.try_clone().unwrap().into();
+        let (ready_sent, readiness) = tokio::sync::oneshot::channel();
+        let (cleaned, mut finished) = tokio::sync::oneshot::channel();
+        let error = deadline(ReportServer::start_inner(
+            ReportListener::Prebound(fd),
+            healthy_stats(),
+            ServerHooks {
+                set_cloexec: Some(|_| Err(std::io::Error::other("injected close-on-exec failure"))),
+                ready_sent: Some(ready_sent),
+                cleaned: Some(cleaned),
+                ..Default::default()
+            },
+        ))
+        .await
+        .err()
+        .expect("close-on-exec failure must fail start");
+        assert!(
+            error.to_string().contains("injected close-on-exec failure"),
+            "{error}"
+        );
+        assert!(deadline(readiness).await.is_err(), "readiness was sent");
+        finished
+            .try_recv()
+            .expect("startup returned before cleanup");
+
+        // Failed adoption must leave the owner's listener usable, too.
+        let after = std::fs::symlink_metadata(&socket).unwrap();
+        assert_eq!((after.dev(), after.ino()), (metadata.dev(), metadata.ino()));
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        owner.set_nonblocking(true).unwrap();
+        let owner = tokio::net::UnixListener::from_std(owner).unwrap();
+        let _client = deadline(tokio::net::UnixStream::connect(&socket))
+            .await
+            .unwrap();
+        deadline(owner.accept()).await.unwrap();
     }
 
     #[tokio::test]

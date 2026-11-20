@@ -410,7 +410,8 @@ whenever monitord stops.
 
 Enable `monitord-report.socket` and `[report] enabled` together. Passing an
 activation fd to a one-shot or reporting-disabled binary is a configuration
-error. Listener setup failure or a server that stops unexpectedly makes the binary exit nonzero, allowing `Restart=on-failure` to
+error. Invalid activation, listener setup failure, or a server that stops
+unexpectedly makes the binary exit nonzero, allowing `Restart=on-failure` to
 restart it. The socket unit retains its listener across service restarts;
 queued new connections can be answered by the next process. Connections
 already accepted by the previous process are lost.
