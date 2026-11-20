@@ -3,6 +3,7 @@
 //! `src/shared/varlink-io.systemd.Network.c`.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use zlink::{proxy, ReplyError};
 
 pub const NETWORK_SOCKET_PATH: &str = "/run/systemd/netif/io.systemd.Network";
@@ -61,19 +62,10 @@ pub struct Interface {
 }
 
 /// Errors that can occur in the io.systemd.Network interface.
-#[derive(Debug, Clone, PartialEq, ReplyError)]
+#[derive(Error, Debug, Clone, PartialEq, ReplyError)]
+#[error("No such interface")]
 #[zlink(interface = "io.systemd.Network")]
 pub enum NetworkError {
     /// The requested interface was not found.
     NoSuchInterface,
 }
-
-impl std::fmt::Display for NetworkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NetworkError::NoSuchInterface => write!(f, "No such interface"),
-        }
-    }
-}
-
-impl std::error::Error for NetworkError {}

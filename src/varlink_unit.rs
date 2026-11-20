@@ -138,69 +138,52 @@ pub fn is_oneshot(output: &ListOutput) -> bool {
 /// A cgroup field with no filesystem data falls back to the reply value,
 /// defaulting to UNSET when the reply omits it too.
 pub fn map_service_stats(output: &ListOutput, cgroup: &crate::cgroup::CgroupStats) -> ServiceStats {
-    let runtime = output.runtime.as_ref();
-    let cgroup_reply = runtime.and_then(|runtime| runtime.cgroup.as_ref());
-    let service_runtime = runtime.and_then(|runtime| runtime.service.as_ref());
-    let service_context = output
-        .context
+    let empty_cgroup = Default::default();
+    let reply = output
+        .runtime
         .as_ref()
-        .and_then(|context| context.service.as_ref());
-
-    let realtime = |pick: fn(
-        &crate::varlink::unit::UnitRuntime,
-    ) -> Option<crate::varlink::unit::Timestamp>| {
-        runtime
-            .and_then(pick)
-            .and_then(|timestamp| timestamp.realtime)
-            .unwrap_or(0)
-    };
-
-    // cgroupfs first, reply as fallback, UNSET when neither has data:
-    // systemd omits reply fields when the matching accounting option is off,
-    // and the D-Bus properties then read `[not set]` (u64::MAX). Answering 0
-    // would report a service as using no memory rather than as unmeasured.
-    let reply =
-        |pick: fn(&crate::varlink::unit::CGroupRuntime) -> Option<u64>| cgroup_reply.and_then(pick);
-    let or_reply = |fs: Option<u64>, reply: Option<u64>| fs.or(reply).unwrap_or(UNSET);
-    ServiceStats {
-        active_enter_timestamp: realtime(|runtime| runtime.active_enter_timestamp),
-        active_exit_timestamp: realtime(|runtime| runtime.active_exit_timestamp),
-        cpuusage_nsec: or_reply(cgroup.cpu_usage_nsec, reply(|cgroup| cgroup.cpu_usage_nsec)),
-        inactive_exit_timestamp: realtime(|runtime| runtime.inactive_exit_timestamp),
-        ioread_bytes: or_reply(cgroup.io_read_bytes, reply(|cgroup| cgroup.io_read_bytes)),
-        ioread_operations: or_reply(
-            cgroup.io_read_operations,
-            reply(|cgroup| cgroup.io_read_operations),
-        ),
-        memory_available: or_reply(
-            cgroup.memory_available,
-            reply(|cgroup| cgroup.memory_available),
-        ),
-        memory_current: or_reply(cgroup.memory_current, reply(|cgroup| cgroup.memory_current)),
-        nrestarts: service_runtime
-            .and_then(|service| service.n_restarts)
-            .unwrap_or(0),
+        .and_then(|runtime| runtime.cgroup.as_ref())
+        .unwrap_or(&empty_cgroup);
+    let or_reply = |fs: Option<u64>, reply| fs.or(reply).unwrap_or(UNSET);
+    let mut stats = ServiceStats {
+        cpuusage_nsec: or_reply(cgroup.cpu_usage_nsec, reply.cpu_usage_nsec),
+        ioread_bytes: or_reply(cgroup.io_read_bytes, reply.io_read_bytes),
+        ioread_operations: or_reply(cgroup.io_read_operations, reply.io_read_operations),
+        memory_available: or_reply(cgroup.memory_available, reply.memory_available),
+        memory_current: or_reply(cgroup.memory_current, reply.memory_current),
+        tasks_current: or_reply(cgroup.tasks_current, reply.tasks_current),
         processes: cgroup.processes,
-        restart_usec: service_context
-            .and_then(|service| service.restart_usec)
-            .unwrap_or(0),
-        state_change_timestamp: realtime(|runtime| runtime.state_change_timestamp),
-        status_errno: service_runtime
-            .and_then(|service| service.status_errno)
-            .unwrap_or(0),
-        tasks_current: or_reply(cgroup.tasks_current, reply(|cgroup| cgroup.tasks_current)),
-        // Under context.Exec, not context.Service as the D-Bus property name
-        // suggests. Defaults to infinity, which D-Bus reports as u64::MAX.
+        // TimeoutCleanUSec is under Exec and defaults to infinity on D-Bus.
         timeout_clean_usec: output
             .context
             .as_ref()
             .and_then(|context| context.exec.as_ref())
             .and_then(|exec| exec.timeout_clean_usec)
             .unwrap_or(UNSET),
-        watchdog_usec: service_context
-            .and_then(|service| service.watchdog_usec)
-            .unwrap_or(0),
+        ..ServiceStats::default()
+    };
+    if let Some(service) = output
+        .context
+        .as_ref()
+        .and_then(|context| context.service.as_ref())
+    {
+        stats.restart_usec = service.restart_usec.unwrap_or_default();
+        stats.watchdog_usec = service.watchdog_usec.unwrap_or_default();
     }
+    if let Some(runtime) = &output.runtime {
+        let realtime = |ts: Option<crate::varlink::unit::Timestamp>| {
+            ts.and_then(|ts| ts.realtime).unwrap_or_default()
+        };
+        stats.active_enter_timestamp = realtime(runtime.active_enter_timestamp);
+        stats.active_exit_timestamp = realtime(runtime.active_exit_timestamp);
+        stats.inactive_exit_timestamp = realtime(runtime.inactive_exit_timestamp);
+        stats.state_change_timestamp = realtime(runtime.state_change_timestamp);
+        if let Some(service) = &runtime.service {
+            stats.nrestarts = service.n_restarts.unwrap_or_default();
+            stats.status_errno = service.status_errno.unwrap_or_default();
+        }
+    }
+    stats
 }
 
 /// Whether `map_service_stats` would take any cgroup counter from the reply
@@ -253,74 +236,48 @@ pub fn timer_triggered_unit(output: &ListOutput) -> Option<&str> {
 /// leaves those two fields at 0 — the same as the D-Bus path, which reports 0
 /// when the timer names no unit.
 pub fn map_timer_stats(output: &ListOutput, triggered: Option<&ListOutput>) -> TimerStats {
-    let context = output
+    let mut stats = TimerStats::default();
+    if let Some(timer) = output
         .context
         .as_ref()
-        .and_then(|context| context.timer.as_ref());
-    let runtime = output
+        .and_then(|context| context.timer.as_ref())
+    {
+        stats.accuracy_usec = timer.accuracy_usec.unwrap_or_default();
+        stats.fixed_random_delay = timer.fixed_random_delay.unwrap_or_default();
+        stats.persistent = timer.persistent.unwrap_or_default();
+        stats.randomized_delay_usec = timer.randomized_delay_usec.unwrap_or_default();
+        stats.remain_after_elapse = timer.remain_after_elapse.unwrap_or_default();
+    }
+    if let Some(timer) = output
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.timer.as_ref());
-    let last_trigger = runtime.and_then(|runtime| runtime.last_trigger_usec);
-    let service_state_change = triggered
-        .and_then(|triggered| triggered.runtime.as_ref())
-        .and_then(|runtime| runtime.state_change_timestamp);
-
-    TimerStats {
-        accuracy_usec: context.and_then(|timer| timer.accuracy_usec).unwrap_or(0),
-        fixed_random_delay: context
-            .and_then(|timer| timer.fixed_random_delay)
-            .unwrap_or(false),
-        last_trigger_usec: last_trigger
-            .and_then(|timestamp| timestamp.realtime)
-            .unwrap_or(0),
-        last_trigger_usec_monotonic: last_trigger
-            .and_then(|timestamp| timestamp.monotonic)
-            .unwrap_or(0),
-        next_elapse_usec_monotonic: runtime
-            .and_then(|timer| timer.next_elapse_usec_monotonic)
-            .unwrap_or(0),
-        next_elapse_usec_realtime: runtime
-            .and_then(|timer| timer.next_elapse_usec_realtime)
-            .unwrap_or(0),
-        persistent: context.and_then(|timer| timer.persistent).unwrap_or(false),
-        randomized_delay_usec: context
-            .and_then(|timer| timer.randomized_delay_usec)
-            .unwrap_or(0),
-        remain_after_elapse: context
-            .and_then(|timer| timer.remain_after_elapse)
-            .unwrap_or(false),
-        service_unit_last_state_change_usec: service_state_change
-            .and_then(|timestamp| timestamp.realtime)
-            .unwrap_or(0),
-        service_unit_last_state_change_usec_monotonic: service_state_change
-            .and_then(|timestamp| timestamp.monotonic)
-            .unwrap_or(0),
+        .and_then(|runtime| runtime.timer.as_ref())
+    {
+        stats.next_elapse_usec_monotonic = timer.next_elapse_usec_monotonic.unwrap_or_default();
+        stats.next_elapse_usec_realtime = timer.next_elapse_usec_realtime.unwrap_or_default();
+        if let Some(timestamp) = timer.last_trigger_usec {
+            stats.last_trigger_usec = timestamp.realtime.unwrap_or_default();
+            stats.last_trigger_usec_monotonic = timestamp.monotonic.unwrap_or_default();
+        }
     }
+    if let Some(timestamp) = triggered
+        .and_then(|unit| unit.runtime.as_ref())
+        .and_then(|runtime| runtime.state_change_timestamp)
+    {
+        stats.service_unit_last_state_change_usec = timestamp.realtime.unwrap_or_default();
+        stats.service_unit_last_state_change_usec_monotonic =
+            timestamp.monotonic.unwrap_or_default();
+    }
+    stats
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::varlink::unit::{
-        CGroupRuntime, ExecContext, ServiceContext, ServiceRuntime, TimerContext, TimerRuntime,
-        Timestamp, UnitContext, UnitRuntime,
-    };
+    use serde_json::{json, Value};
 
-    fn output(context: Option<UnitContext>, runtime: Option<UnitRuntime>) -> ListOutput {
-        ListOutput { context, runtime }
-    }
-
-    fn service_context(r#type: &str) -> UnitContext {
-        UnitContext {
-            service: Some(ServiceContext {
-                r#type: Some(r#type.to_string()),
-                restart_usec: None,
-                watchdog_usec: None,
-            }),
-            exec: None,
-            timer: None,
-        }
+    fn reply(value: Value) -> ListOutput {
+        serde_json::from_value(value).expect("valid Unit.List reply")
     }
 
     #[test]
@@ -337,10 +294,9 @@ mod tests {
             ("TasksCurrent", |c| c.tasks_current = Some(1)),
         ];
         for (key, set) in counters {
-            let reply: ListOutput = serde_json::from_value(serde_json::json!({
+            let reply = reply(json!({
                 "runtime": { "CGroup": { "Path": "/system.slice/a.service", key: 7 } }
-            }))
-            .expect("valid reply");
+            }));
             let unread = crate::cgroup::CgroupStats::default();
             let mut read = crate::cgroup::CgroupStats::default();
             set(&mut read);
@@ -350,78 +306,59 @@ mod tests {
             assert!(!uses_reply_cgroup_fallback(&reply, &read), "{key}");
         }
         // Neither side had a value, or no cgroup section at all.
-        let bare: ListOutput = serde_json::from_value(serde_json::json!({
+        let bare = reply(json!({
             "runtime": { "CGroup": { "Path": "/system.slice/a.service" } }
-        }))
-        .expect("valid reply");
+        }));
         let unread = crate::cgroup::CgroupStats::default();
         assert!(!uses_reply_cgroup_fallback(&bare, &unread));
-        assert!(!uses_reply_cgroup_fallback(&output(None, None), &unread));
+        assert!(!uses_reply_cgroup_fallback(&reply(json!({})), &unread));
     }
 
     #[test]
     fn test_is_oneshot() {
-        assert!(is_oneshot(&output(Some(service_context("oneshot")), None)));
-        assert!(!is_oneshot(&output(
-            Some(service_context("notify-reload")),
-            None
-        )));
+        let service = |kind: &str| reply(json!({"context": {"Service": {"Type": kind}}}));
+        assert!(is_oneshot(&service("oneshot")));
+        assert!(!is_oneshot(&service("notify-reload")));
         // A unit with no service context at all is not a service, let alone a
         // oneshot one — the D-Bus path treats a failed lookup the same way.
-        assert!(!is_oneshot(&output(None, None)));
+        assert!(!is_oneshot(&reply(json!({}))));
     }
 
     #[test]
     fn test_map_service_stats_from_a_populated_reply() {
         let stats = map_service_stats(
-            &output(
-                Some(UnitContext {
-                    service: Some(ServiceContext {
-                        r#type: Some("notify-reload".to_string()),
-                        restart_usec: Some(100_000),
-                        watchdog_usec: None,
-                    }),
-                    // TimeoutCleanUSec lives here, not under Service.
-                    exec: Some(ExecContext {
-                        timeout_clean_usec: Some(30_000_000),
-                    }),
-                    timer: None,
-                }),
-                Some(UnitRuntime {
-                    state_change_timestamp: Some(Timestamp {
-                        realtime: Some(1_789_701_442_296_989),
-                        monotonic: Some(3_774_344_633),
-                    }),
-                    active_enter_timestamp: Some(Timestamp {
-                        realtime: Some(1_789_701_442_296_989),
-                        monotonic: Some(3_774_344_633),
-                    }),
-                    inactive_exit_timestamp: Some(Timestamp {
-                        realtime: Some(1_789_701_442_287_084),
-                        monotonic: Some(3_774_334_729),
-                    }),
-                    active_exit_timestamp: Some(Timestamp {
-                        realtime: Some(1_789_701_442_280_000),
-                        monotonic: Some(3_774_327_645),
-                    }),
-                    cgroup: Some(CGroupRuntime {
-                        path: Some("/system.slice/dbus-broker.service".to_string()),
-                        cpu_usage_nsec: Some(86_690_000),
-                        memory_current: Some(3_457_024),
-                        memory_available: Some(7_619_899_392),
-                        tasks_current: Some(2),
-                        io_read_bytes: None,
-                        io_read_operations: None,
-                    }),
-                    service: Some(ServiceRuntime {
-                        main_pid: None,
-                        control_pid: None,
-                        status_errno: Some(0),
-                        n_restarts: Some(0),
-                    }),
-                    timer: None,
-                }),
-            ),
+            &reply(json!({
+                "context": {
+                    "Service": {"Type": "notify-reload", "RestartUSec": 100_000, "WatchdogUSec": null},
+                    "Exec": {"TimeoutCleanUSec": 30_000_000}
+                },
+                "runtime": {
+                    "StateChangeTimestamp": {
+                        "realtime": 1_789_701_442_296_989_u64,
+                        "monotonic": 3_774_344_633_u64
+                    },
+                    "ActiveEnterTimestamp": {
+                        "realtime": 1_789_701_442_296_989_u64,
+                        "monotonic": 3_774_344_633_u64
+                    },
+                    "InactiveExitTimestamp": {
+                        "realtime": 1_789_701_442_287_084_u64,
+                        "monotonic": 3_774_334_729_u64
+                    },
+                    "ActiveExitTimestamp": {
+                        "realtime": 1_789_701_442_280_000_u64,
+                        "monotonic": 3_774_327_645_u64
+                    },
+                    "CGroup": {
+                        "Path": "/system.slice/dbus-broker.service",
+                        "CPUUsageNSec": 86_690_000,
+                        "MemoryCurrent": 3_457_024,
+                        "MemoryAvailable": 7_619_899_392_u64,
+                        "TasksCurrent": 2
+                    },
+                    "Service": {"StatusErrno": 13, "NRestarts": 2}
+                }
+            })),
             // cgroupfs has fresher data than the reply for these three; the
             // rest fall back to the reply values above.
             &crate::cgroup::CgroupStats {
@@ -433,7 +370,11 @@ mod tests {
             },
         );
 
+        assert_eq!(stats.state_change_timestamp, 1_789_701_442_296_989);
         assert_eq!(stats.active_enter_timestamp, 1_789_701_442_296_989);
+        assert_eq!(stats.inactive_exit_timestamp, 1_789_701_442_287_084);
+        assert_eq!(stats.status_errno, 13);
+        assert_eq!(stats.nrestarts, 2);
         // cgroupfs wins where it has data…
         assert_eq!(stats.cpuusage_nsec, 90_000_000);
         assert_eq!(stats.memory_current, 4_000_000);
@@ -455,55 +396,33 @@ mod tests {
 
     fn timer_output() -> ListOutput {
         // Shaped from a real systemd-tmpfiles-clean.timer reply.
-        ListOutput {
-            context: Some(UnitContext {
-                service: None,
-                exec: None,
-                timer: Some(TimerContext {
-                    unit: Some("systemd-tmpfiles-clean.service".to_string()),
-                    accuracy_usec: Some(60_000_000),
-                    randomized_delay_usec: None,
-                    fixed_random_delay: Some(false),
-                    persistent: Some(false),
-                    remain_after_elapse: Some(true),
-                }),
-            }),
-            runtime: Some(UnitRuntime {
-                state_change_timestamp: None,
-                active_enter_timestamp: None,
-                inactive_exit_timestamp: None,
-                active_exit_timestamp: None,
-                cgroup: None,
-                service: None,
-                timer: Some(TimerRuntime {
-                    next_elapse_usec_realtime: Some(0),
-                    next_elapse_usec_monotonic: Some(91_091_400_515),
-                    last_trigger_usec: Some(Timestamp {
-                        realtime: Some(1_789_702_359_355_506),
-                        monotonic: Some(4_691_399_604),
-                    }),
-                }),
-            }),
-        }
+        reply(json!({
+            "context": {"Timer": {
+                "Unit": "systemd-tmpfiles-clean.service",
+                "AccuracyUSec": 60_000_000,
+                "FixedRandomDelay": false,
+                "Persistent": false,
+                "RemainAfterElapse": true
+            }},
+            "runtime": {"Timer": {
+                "NextElapseUSecRealtime": 0,
+                "NextElapseUSecMonotonic": 91_091_400_515_u64,
+                "LastTriggerUSec": {
+                    "realtime": 1_789_702_359_355_506_u64,
+                    "monotonic": 4_691_399_604_u64
+                }
+            }}
+        }))
     }
 
     #[test]
     fn test_map_timer_stats() {
-        let triggered = output(
-            None,
-            Some(UnitRuntime {
-                state_change_timestamp: Some(Timestamp {
-                    realtime: Some(1_789_702_359_400_000),
-                    monotonic: Some(4_691_444_098),
-                }),
-                active_enter_timestamp: None,
-                inactive_exit_timestamp: None,
-                active_exit_timestamp: None,
-                cgroup: None,
-                service: None,
-                timer: None,
-            }),
-        );
+        let triggered = reply(json!({
+            "runtime": {"StateChangeTimestamp": {
+                "realtime": 1_789_702_359_400_000_u64,
+                "monotonic": 4_691_444_098_u64
+            }}
+        }));
         let stats = map_timer_stats(&timer_output(), Some(&triggered));
 
         assert_eq!(stats.accuracy_usec, 60_000_000);
@@ -543,7 +462,7 @@ mod tests {
             timer_triggered_unit(&timer_output()),
             Some("systemd-tmpfiles-clean.service")
         );
-        assert_eq!(timer_triggered_unit(&output(None, None)), None);
+        assert_eq!(timer_triggered_unit(&reply(json!({}))), None);
     }
 
     #[test]
@@ -551,7 +470,7 @@ mod tests {
         // Everything absent must land on the D-Bus defaults rather than zeroing
         // the unset sentinels. A service with accounting off reports [not set]
         // over D-Bus, so reporting 0 bytes of memory would be a fabrication.
-        let stats = map_service_stats(&output(None, None), &crate::cgroup::CgroupStats::default());
+        let stats = map_service_stats(&reply(json!({})), &crate::cgroup::CgroupStats::default());
         assert_eq!(stats.ioread_bytes, u64::MAX);
         assert_eq!(stats.ioread_operations, u64::MAX);
         assert_eq!(stats.timeout_clean_usec, u64::MAX);
@@ -569,7 +488,7 @@ mod tests {
         // A reply with no CGroup section (accounting off, pre-v261, or an
         // inactive unit) still reports everything cgroupfs could read.
         let stats = map_service_stats(
-            &output(None, None),
+            &reply(json!({})),
             &crate::cgroup::CgroupStats {
                 cpu_usage_nsec: Some(1_000),
                 memory_current: Some(2_000),

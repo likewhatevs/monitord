@@ -4,6 +4,7 @@
 //! systemd v257.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use zlink::{proxy, ReplyError};
 
 use crate::varlink::unit::ProcessId;
@@ -37,7 +38,7 @@ pub struct ListOutput {
 }
 
 /// Errors that can occur in the io.systemd.Machine interface.
-#[derive(Debug, Clone, PartialEq, ReplyError)]
+#[derive(Error, Debug, Clone, PartialEq, ReplyError)]
 #[zlink(interface = "io.systemd.Machine")]
 pub enum MachineError {
     /// No machine matches the request (also what an empty List returns).
@@ -54,8 +55,6 @@ impl std::fmt::Display for MachineError {
         }
     }
 }
-
-impl std::error::Error for MachineError {}
 
 #[cfg(test)]
 mod tests {

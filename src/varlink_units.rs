@@ -15,6 +15,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::error;
@@ -30,7 +31,7 @@ use crate::units::SystemdUnitStats;
 use crate::varlink::metrics::{ListOutput, Metrics};
 use crate::MachineStats;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{StreamExt, TryStreamExt};
 
 pub const METRICS_SOCKET_PATH: &str = "/run/systemd/report/io.systemd.Manager";
 
@@ -46,15 +47,14 @@ pub type SharedMetrics =
 
 /// Parse a string value from a metric into an enum type, warning on failure
 fn parse_metric_enum<T: FromStr>(metric: &ListOutput) -> Option<T> {
-    if !metric.value().is_string() {
+    let Some(value_str) = metric.value().as_str() else {
         warn!(
             "Metric {} has non-string value: {:?}",
             metric.name(),
             metric.value()
         );
         return None;
-    }
-    let value_str = metric.value_as_string();
+    };
     // Normalize hyphens to underscores to match enum variant names (e.g. "not-found" -> "not_found"),
     // mirroring the same replacement done in the D-Bus path (units.rs::parse_state).
     let normalized = value_str.replace('-', "_");
@@ -69,6 +69,13 @@ fn parse_metric_enum<T: FromStr>(metric: &ListOutput) -> Option<T> {
             None
         }
     }
+}
+
+/// Decode the integer at the width of its destination field.
+fn parse_metric_integer<T: serde::de::DeserializeOwned>(metric: &ListOutput) -> Option<T> {
+    T::deserialize(metric.value())
+        .inspect_err(|err| warn!("Invalid value for metric {}: {err}", metric.name()))
+        .ok()
 }
 
 /// Check if a unit name should be skipped based on allowlist/blocklist
@@ -157,25 +164,8 @@ pub fn parse_one_metric(
             if !services.contains(&object_name) {
                 return Ok(());
             }
-            if !metric.value().is_i64() {
-                warn!(
-                    "Metric {} has non-integer value: {:?}",
-                    metric.name(),
-                    metric.value()
-                );
+            let Some(nrestarts) = parse_metric_integer(metric) else {
                 return Ok(());
-            }
-            let value = metric.value_as_int();
-            let nrestarts: u32 = match value.try_into() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(
-                        "Metric {} has out-of-range value for u32: {}",
-                        metric.name(),
-                        value
-                    );
-                    return Ok(());
-                }
             };
             stats
                 .service_stats
@@ -188,30 +178,10 @@ pub fn parse_one_metric(
             if !services.contains(&object_name) {
                 return Ok(());
             }
-            if !metric.value().is_i64() {
-                warn!(
-                    "Metric {} has non-integer value: {:?}",
-                    metric.name(),
-                    metric.value()
-                );
+            // systemd emits the metric unsigned, but the D-Bus StatusErrno
+            // property that ServiceStats follows is an i32.
+            let Some(status_errno) = parse_metric_integer(metric) else {
                 return Ok(());
-            }
-            let value = metric.value_as_int();
-            // systemd rejects a negative ERRNO= in sd_notify ("Numerical result
-            // out of range") and emits this metric unsigned, so the value is
-            // non-negative. It is still stored as i32 to match the D-Bus
-            // StatusErrno property that ServiceStats is typed from, which is
-            // what makes the conversion below worth checking.
-            let status_errno: i32 = match value.try_into() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(
-                        "Metric {} has out-of-range value for i32: {}",
-                        metric.name(),
-                        value
-                    );
-                    return Ok(());
-                }
             };
             stats
                 .service_stats
@@ -221,21 +191,8 @@ pub fn parse_one_metric(
         }
         "UnitsByTypeTotal" => {
             if let Some(type_str) = metric.get_field_as_str("type") {
-                if !metric.value().is_i64() {
-                    warn!(
-                        "Metric {} has non-integer value: {:?}",
-                        metric.name(),
-                        metric.value()
-                    );
+                let Some(value) = parse_metric_integer(metric) else {
                     return Ok(());
-                }
-                let value = metric.value_as_int();
-                let value: u64 = match value.try_into() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!("Metric {} has negative value: {}", metric.name(), value);
-                        return Ok(());
-                    }
                 };
                 match type_str {
                     "automount" => stats.automount_units = value,
@@ -254,21 +211,8 @@ pub fn parse_one_metric(
         }
         "UnitsByLoadStateTotal" => {
             if let Some(load_state_str) = metric.get_field_as_str("load_state") {
-                if !metric.value().is_i64() {
-                    warn!(
-                        "Metric {} has non-integer value: {:?}",
-                        metric.name(),
-                        metric.value()
-                    );
+                let Some(value) = parse_metric_integer(metric) else {
                     return Ok(());
-                }
-                let value = metric.value_as_int();
-                let value: u64 = match value.try_into() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!("Metric {} has negative value: {}", metric.name(), value);
-                        return Ok(());
-                    }
                 };
                 match load_state_str {
                     "loaded" => stats.loaded_units = value,
@@ -282,21 +226,8 @@ pub fn parse_one_metric(
         }
         "UnitsByStateTotal" => {
             if let Some(state_str) = metric.get_field_as_str("state") {
-                if !metric.value().is_i64() {
-                    warn!(
-                        "Metric {} has non-integer value: {:?}",
-                        metric.name(),
-                        metric.value()
-                    );
+                let Some(value) = parse_metric_integer(metric) else {
                     return Ok(());
-                }
-                let value = metric.value_as_int();
-                let value: u64 = match value.try_into() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!("Metric {} has negative value: {}", metric.name(), value);
-                        return Ok(());
-                    }
                 };
                 match state_str {
                     "activating" => stats.activating_units = value,
@@ -311,37 +242,13 @@ pub fn parse_one_metric(
             }
         }
         "JobsQueued" => {
-            if !metric.value().is_i64() {
-                warn!(
-                    "Metric {} has non-integer value: {:?}",
-                    metric.name(),
-                    metric.value()
-                );
-                return Ok(());
-            }
-            let value = metric.value_as_int();
-            match value.try_into() {
-                Ok(value) => stats.jobs_queued = value,
-                Err(_) => {
-                    warn!("Metric {} has negative value: {}", metric.name(), value);
-                }
+            if let Some(value) = parse_metric_integer(metric) {
+                stats.jobs_queued = value;
             }
         }
         "UnitsTotal" => {
-            if !metric.value().is_i64() {
-                warn!(
-                    "Metric {} has non-integer value: {:?}",
-                    metric.name(),
-                    metric.value()
-                );
-                return Ok(());
-            }
-            let value = metric.value_as_int();
-            match value.try_into() {
-                Ok(value) => stats.total_units = value,
-                Err(_) => {
-                    warn!("Metric {} has negative value: {}", metric.name(), value);
-                }
+            if let Some(value) = parse_metric_integer(metric) {
+                stats.total_units = value;
             }
         }
         "StateChangeTimestamp" => {
@@ -351,24 +258,8 @@ pub fn parse_one_metric(
             {
                 return Ok(());
             }
-            if !metric.value().is_i64() {
-                warn!(
-                    "Metric {} has non-integer value: {:?}",
-                    metric.name(),
-                    metric.value()
-                );
+            let Some(state_change_usec) = parse_metric_integer(metric) else {
                 return Ok(());
-            }
-            let state_change_usec: u64 = match metric.value_as_int().try_into() {
-                Ok(value) => value,
-                Err(_) => {
-                    warn!(
-                        "Metric {} has out-of-range value: {}",
-                        metric.name(),
-                        metric.value_as_int()
-                    );
-                    return Ok(());
-                }
             };
             let now_usec = match SystemTime::now().duration_since(UNIX_EPOCH) {
                 Ok(elapsed) => elapsed.as_secs() * 1_000_000 + u64::from(elapsed.subsec_micros()),
@@ -408,25 +299,17 @@ pub(crate) async fn collect_metrics(
         rt.block_on(async move {
             let mut conn = endpoint.connect().await?;
             let stream = conn.list().await?;
-            futures_util::pin_mut!(stream);
-
-            let mut metrics = Vec::new();
-            let mut count = 0;
-            while let Some(result) = stream.try_next().await? {
-                let result: std::result::Result<ListOutput, _> = result;
-                match result {
-                    Ok(metric) => {
-                        debug!("Metrics {}: {:?}", count, metric);
-                        count += 1;
-                        metrics.push(metric);
-                    }
-                    Err(e) => {
-                        debug!("Error deserializing metric {}: {:?}", count, e);
-                        return Err(anyhow::anyhow!(e));
-                    }
-                }
-            }
-            Ok(metrics)
+            stream
+                .enumerate()
+                .map(|(index, reply)| {
+                    let metric = reply?.inspect_err(|e| {
+                        debug!("Error deserializing metric {}: {:?}", index, e);
+                    })?;
+                    debug!("Metrics {}: {:?}", index, metric);
+                    Ok(metric)
+                })
+                .try_collect()
+                .await
         })
     })
     .await?
@@ -767,14 +650,14 @@ pub async fn parse_metrics(
             .filter_map(|metric| {
                 let object = metric.object()?;
                 services.contains(object).then_some(())?;
-                Some((object.to_string(), metric.value().as_i64()?))
+                Some((object, metric.value()))
             })
     };
     let nrestarts = service_metric("NRestarts")
-        .filter_map(|(name, value)| Some((name, u32::try_from(value).ok()?)))
+        .filter_map(|(name, value)| Some((name.to_string(), u32::deserialize(value).ok()?)))
         .collect();
     let status_errno = service_metric("StatusErrno")
-        .filter_map(|(name, value)| Some((name, i32::try_from(value).ok()?)))
+        .filter_map(|(name, value)| Some((name.to_string(), i32::deserialize(value).ok()?)))
         .collect();
 
     Ok(UnitDiscovery {
@@ -1138,17 +1021,21 @@ pub async fn apply_unit_details(
 /// Sum per-type counts as a fallback total for systemd versions whose metrics
 /// lack `UnitsTotal`. Mirrors what the D-Bus path computes as `units.len()`,
 /// except unmapped types (e.g. swap) are missed.
-fn sum_units_by_type(stats: &SystemdUnitStats) -> u64 {
-    stats.automount_units
-        + stats.device_units
-        + stats.mount_units
-        + stats.path_units
-        + stats.scope_units
-        + stats.service_units
-        + stats.slice_units
-        + stats.socket_units
-        + stats.target_units
-        + stats.timer_units
+fn sum_units_by_type(stats: &SystemdUnitStats) -> Option<u64> {
+    [
+        stats.automount_units,
+        stats.device_units,
+        stats.mount_units,
+        stats.path_units,
+        stats.scope_units,
+        stats.service_units,
+        stats.slice_units,
+        stats.socket_units,
+        stats.target_units,
+        stats.timer_units,
+    ]
+    .into_iter()
+    .try_fold(0, u64::checked_add)
 }
 
 pub async fn get_unit_stats(
@@ -1173,13 +1060,18 @@ pub async fn get_unit_stats(
 
     // Always collect metrics to get aggregate counts (UnitsByTypeTotal, UnitsByStateTotal)
     // as well as per-unit state data when config.units.state_stats is enabled.
-    let discovery = parse_metrics(&mut stats, metrics, &config.units, &config.services).await?;
+    let discovery =
+        parse_metrics(&mut stats, metrics.clone(), &config.units, &config.services).await?;
 
-    // Prefer the UnitsTotal metric when present: it is exact, including unit
-    // types we do not map (e.g. swap). Fall back to summing per-type counts
-    // on systemd versions whose metrics lack it.
-    if stats.total_units == 0 {
-        stats.total_units = sum_units_by_type(&stats);
+    // Zero is both a valid UnitsTotal and the default when the metric is missing.
+    // Consult the shared reply before falling back to the mapped unit types.
+    if stats.total_units == 0
+        && !await_metrics(metrics).await?.iter().any(|metric| {
+            metric.name_suffix() == "UnitsTotal" && metric.value().as_u64() == Some(0)
+        })
+    {
+        stats.total_units = sum_units_by_type(&stats)
+            .ok_or_else(|| anyhow::anyhow!("sum of UnitsByTypeTotal metrics exceeds u64"))?;
     }
 
     debug!("unit stats: {:?}", stats);
@@ -1583,8 +1475,14 @@ mod tests {
             fields: None,
         };
         let metrics = vec![
-            metric("NRestarts", "a.service", int_value(3)),
+            metric("NRestarts", "a.service", serde_json::json!(u32::MAX)),
+            metric("NRestarts", "a.service", int_value(i64::from(u32::MAX) + 1)),
             metric("StatusErrno", "a.service", int_value(0)),
+            metric(
+                "StatusErrno",
+                "a.service",
+                int_value(i64::from(i32::MAX) + 1),
+            ),
             metric("NRestarts", "b.service", int_value(-1)),
             metric("StatusErrno", "b.service", empty_value()),
             metric("NRestarts", "untracked.service", int_value(7)),
@@ -1605,7 +1503,7 @@ mod tests {
             .expect("parse");
         assert_eq!(
             discovery.nrestarts,
-            HashMap::from([("a.service".to_string(), 3)])
+            HashMap::from([("a.service".to_string(), u32::MAX)])
         );
         assert_eq!(
             discovery.status_errno,
@@ -1825,6 +1723,29 @@ mod tests {
         assert!(!stats.service_stats.contains_key("other.service"));
     }
 
+    #[test]
+    fn test_unit_total_accepts_full_u64_range() {
+        let mut metric = ListOutput {
+            name: "io.systemd.Manager.UnitsTotal".to_owned(),
+            value: serde_json::json!(u64::MAX),
+            object: None,
+            fields: None,
+        };
+        let mut stats = SystemdUnitStats::default();
+        let config = default_units_config();
+        parse_one_metric(&mut stats, &metric, &config, &HashSet::new(), false).unwrap();
+        assert_eq!(stats.total_units, u64::MAX);
+        for invalid in [
+            serde_json::json!("1"),
+            serde_json::json!(-1),
+            serde_json::json!(1.0),
+        ] {
+            metric.value = invalid;
+            parse_one_metric(&mut stats, &metric, &config, &HashSet::new(), false).unwrap();
+            assert_eq!(stats.total_units, u64::MAX);
+        }
+    }
+
     #[tokio::test]
     async fn test_parse_aggregated_metrics() {
         let mut stats = SystemdUnitStats::default();
@@ -1968,6 +1889,37 @@ mod tests {
         assert!(require_unit_context("foo.socket", &bare).is_ok());
     }
 
+    #[tokio::test]
+    async fn test_zero_unit_total_takes_precedence_over_type_counts() {
+        let config = crate::config::Config::default();
+        for (totals, expected) in [
+            (vec![], 7),
+            (vec![-1], 7),
+            (vec![0, -1], 0),
+            (vec![5, 0], 0),
+        ] {
+            let mut rows = vec![serde_json::json!({
+                "name": "io.systemd.Manager.UnitsByTypeTotal",
+                "fields": {"type": "service"},
+                "value": 7,
+            })];
+            rows.extend(totals.iter().map(|total| {
+                serde_json::json!({
+                    "name": "io.systemd.Manager.UnitsTotal", "value": total
+                })
+            }));
+            let metrics = serde_json::from_value(serde_json::Value::Array(rows)).unwrap();
+            let shared = futures_util::future::ready(Ok(Arc::new(metrics)))
+                .boxed()
+                .shared();
+            let (stats, _) = get_unit_stats(&config, shared).await.unwrap();
+            assert_eq!(
+                stats.total_units, expected,
+                "UnitsTotal readings {totals:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_sum_units_by_type_fallback() {
         // The fallback sums mapped per-type counts; unmapped types like swap
@@ -1977,8 +1929,15 @@ mod tests {
             timer_units: 2,
             ..Default::default()
         };
-        assert_eq!(sum_units_by_type(&stats), 88);
-        assert_eq!(sum_units_by_type(&SystemdUnitStats::default()), 0);
+        assert_eq!(sum_units_by_type(&stats), Some(88));
+        assert_eq!(sum_units_by_type(&SystemdUnitStats::default()), Some(0));
+        assert_eq!(
+            sum_units_by_type(&SystemdUnitStats {
+                service_units: u64::MAX,
+                ..stats
+            }),
+            None
+        );
     }
 
     #[test]

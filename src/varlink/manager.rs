@@ -3,6 +3,7 @@
 //! `src/core/varlink-manager.c`.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use zlink::{proxy, ReplyError};
 
 pub const MANAGER_SOCKET_PATH: &str = "/run/systemd/io.systemd.Manager";
@@ -35,19 +36,10 @@ pub struct ManagerRuntime {
 }
 
 /// Errors that can occur in the io.systemd.Manager interface.
-#[derive(Debug, Clone, PartialEq, ReplyError)]
+#[derive(Error, Debug, Clone, PartialEq, ReplyError)]
+#[error("Rate limit reached")]
 #[zlink(interface = "io.systemd.Manager")]
 pub enum ManagerError {
     /// The manager is refusing calls because it is being hammered.
     RateLimitReached,
 }
-
-impl std::fmt::Display for ManagerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ManagerError::RateLimitReached => write!(f, "Rate limit reached"),
-        }
-    }
-}
-
-impl std::error::Error for ManagerError {}

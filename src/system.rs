@@ -179,16 +179,7 @@ impl TryFrom<String> for SystemdVersion {
 /// Shared by the D-Bus `SystemState` property and the varlink
 /// `io.systemd.Manager.Describe` runtime field, which use the same vocabulary.
 pub fn parse_system_state(system_state: &str) -> SystemdSystemState {
-    match system_state {
-        "initializing" => SystemdSystemState::initializing,
-        "starting" => SystemdSystemState::starting,
-        "running" => SystemdSystemState::running,
-        "degraded" => SystemdSystemState::degraded,
-        "maintenance" => SystemdSystemState::maintenance,
-        "stopping" => SystemdSystemState::stopping,
-        "offline" => SystemdSystemState::offline,
-        _ => SystemdSystemState::unknown,
-    }
+    system_state.parse().unwrap_or_default()
 }
 
 //pub fn get_system_state(dbus_address: &str) -> Result<SystemdSystemState, dbus::Error> {
