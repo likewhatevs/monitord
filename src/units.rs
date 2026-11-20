@@ -13,6 +13,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use futures_util::StreamExt;
 use struct_field_names_as_array::FieldNamesAsArray;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -764,9 +765,8 @@ async fn enumerate_user_transient_dirs(fs_root: &str) -> Vec<String> {
 /// `fs_root` is prepended to all paths — empty string for the host,
 /// `/proc/<pid>/root` for containers.
 ///
-/// All directory reads are issued in parallel: the three generator directories,
-/// the root transient directory, and user-dir enumeration run concurrently in a
-/// first batch; per-user transient reads run concurrently in a second batch.
+/// Read the generator and root transient directories while listing users.
+/// Limit concurrent per-user reads to avoid exhausting file descriptors.
 pub async fn collect_unit_files_stats(fs_root: &str) -> UnitFilesStats {
     // Pre-bind formatted paths to extend their lifetime across the join.
     let gen_path = format!("{fs_root}/run/systemd/generator");
@@ -788,12 +788,11 @@ pub async fn collect_unit_files_stats(fs_root: &str) -> UnitFilesStats {
     merge_counts(&mut root_generated, gen_early);
     merge_counts(&mut root_generated, gen_late);
 
-    // Second batch: read every user transient directory in parallel.
-    let user_transient_counts =
-        futures_util::future::join_all(user_dirs.iter().map(|d| count_unit_files_by_type(d))).await;
-
     let mut user_transient = HashMap::new();
-    for counts in user_transient_counts {
+    let mut user_counts = futures_util::stream::iter(user_dirs)
+        .map(|dir| async move { count_unit_files_by_type(&dir).await })
+        .buffer_unordered(8);
+    while let Some(counts) = user_counts.next().await {
         merge_counts(&mut user_transient, counts);
     }
 

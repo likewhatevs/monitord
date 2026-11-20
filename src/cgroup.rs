@@ -50,8 +50,7 @@
 //! dependencies (`nix`, `serde`, `oci-spec`, …) and more binary size,
 //! against the embedded goal. None of them models `memory_available`
 //! either — that is a systemd concept, not a kernel file, and it is where
-//! most of this module's complexity lives. So: `tokio::fs` reads issued
-//! together with `tokio::join!`, zero new dependencies, cgroup v2 only.
+//! most of this module's complexity lives.
 //!
 //! ## `fs_root` and containers
 //!
@@ -120,8 +119,7 @@ pub struct CgroupStats {
 /// See `read_host_memory` for the semantics.
 pub type HostMemory = (u64, u64);
 
-/// Read every cgroup accounting file for one service in a single parallel
-/// batch.
+/// Read cgroup accounting for one service.
 ///
 /// `cgroup_path` is the unit's cgroup relative to the mount, e.g.
 /// `/system.slice/chrony.service` (the `ControlGroup` D-Bus property or
@@ -138,9 +136,8 @@ pub type HostMemory = (u64, u64);
 /// so the caller's IPC fallback takes over, like any other unreadable
 /// cgroup.
 ///
-/// The unit-level file reads run concurrently via `tokio::join!`, and callers
-/// join this future with their in-flight D-Bus/varlink calls, so filesystem
-/// IO never serializes behind IPC.
+/// The attribute files share one blocking task. The recursive process walk
+/// runs independently and can stop between directories if collection ends.
 pub async fn read_service_cgroup(
     fs_root: &str,
     cgroup_path: &str,
@@ -150,23 +147,40 @@ pub async fn read_service_cgroup(
     if cgroup_path.is_empty() || cgroup_path == "/" {
         return CgroupStats::default();
     }
-    let dir = format!("{fs_root}/sys/fs/cgroup{cgroup_path}");
-    let dir = dir.as_str();
+    let mount = format!("{fs_root}/sys/fs/cgroup");
+    let dir = format!("{mount}{cgroup_path}");
+    let relative = cgroup_path.to_owned();
+    let span = tracing::Span::current();
+    let attributes = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| read_service_attributes(&mount, &relative, host_memory))
+    });
+    let (attributes, processes) = tokio::join!(attributes, count_processes(&dir, extra_pids));
+    CgroupStats {
+        processes,
+        ..attributes.unwrap_or_else(|err| {
+            debug!("Unable to read cgroup attributes for {dir}: {err}");
+            CgroupStats::default()
+        })
+    }
+}
 
-    // The unit's own `memory.current` is read once here and handed to the
-    // ancestor walk below, which would otherwise re-read the same file for
-    // its level-0 triple.
-    let (cpu, memory_current, tasks, io_stat, processes, levels) = tokio::join!(
-        async { read_file(dir, "cpu.stat").await },
-        async { read_file(dir, "memory.current").await },
-        async { read_file(dir, "pids.current").await },
-        async { read_file(dir, "io.stat").await },
-        async { count_processes(dir, extra_pids).await },
-        async { read_ancestor_levels(fs_root, cgroup_path).await },
-    );
-
+fn read_service_attributes(
+    mount: &str,
+    cgroup_path: &str,
+    host_memory: Option<HostMemory>,
+) -> CgroupStats {
+    let dir = format!("{mount}{cgroup_path}");
+    let cpu = read_file(&dir, "cpu.stat");
+    let tasks = read_file(&dir, "pids.current");
+    let io_stat = read_file(&dir, "io.stat");
+    // The mount root uses host memory instead of cgroup files.
+    let levels: Vec<_> = Path::new(cgroup_path)
+        .ancestors()
+        .take_while(|level| !level.as_os_str().is_empty() && *level != Path::new("/"))
+        .map(|level| read_memory_level(&format!("{mount}{}", level.display())))
+        .collect();
+    let memory_current = levels.first().and_then(|level| level.current);
     let cpu_usage_nsec = cpu.as_deref().and_then(parse_cpu_stat);
-    let memory_current = memory_current.as_deref().and_then(parse_u64);
     let tasks_current = tasks.as_deref().and_then(parse_u64);
     let (io_read_bytes, io_read_operations) = match io_stat.as_deref() {
         Some(contents) => {
@@ -176,35 +190,27 @@ pub async fn read_service_cgroup(
         None => (None, None),
     };
 
-    // `memory_available` needs the ancestor chain as well (`memory.max` /
-    // `memory.high` at every level up to the mount root). The walk ran in
-    // the batch above; the fold only applies when the unit's own level was
-    // actually readable — otherwise there is no cgroup v2 here (v1 host,
-    // stopped unit) and the caller's IPC fallback takes over, like every
-    // other field, instead of silently reporting host `MemAvailable`.
-    let memory_available = match (levels.first(), host_memory) {
-        (Some(first), Some(root)) if first.current.is_some() => {
-            fold_memory_available(&levels, root, memory_current)
-        }
-        _ => None,
-    };
+    // A missing unit cgroup must not report the host's MemAvailable.
+    let memory_available = memory_current
+        .and(host_memory)
+        .and_then(|root| fold_memory_available(&levels, root));
 
     CgroupStats {
         cpu_usage_nsec,
         memory_current,
         memory_available,
         tasks_current,
-        processes,
         io_read_bytes,
         io_read_operations,
+        ..Default::default()
     }
 }
 
 /// Read one cgroup attribute file, returning `None` when it is absent or
 /// unreadable. A missing file is routine (controller not enabled on this
 /// subtree), so it logs at debug, not warn.
-async fn read_file(dir: &str, file: &str) -> Option<String> {
-    match tokio::fs::read_to_string(format!("{dir}/{file}")).await {
+fn read_file(dir: &str, file: &str) -> Option<String> {
+    match std::fs::read_to_string(format!("{dir}/{file}")) {
         Ok(contents) => Some(contents),
         Err(err) => {
             debug!("Unable to read {dir}/{file}: {err:?}");
@@ -296,47 +302,15 @@ struct MemoryLevel {
 ///
 /// `levels` runs from the unit's own cgroup up to (excluding) the filesystem
 /// root; `root` is the always-constrained top (`MemTotal`, host used bytes).
-/// `unit_current` is the unit's own freshly-read `memory.current`, which
-/// takes precedence over whatever the walk stored for level 0 (same file,
-/// one read instead of two). Levels with no limit are skipped; a level
-/// whose current is unreadable reuses the deeper level's current, exactly
-/// like systemd's "previous current propagates as lower bound" — including
-/// level 0 with an unreadable current, which contributes `limit − 0`.
-/// Returns `None` only when nothing was readable at all — in practice the
-/// root level always binds, so this is `Some` whenever `/proc/meminfo`
-/// parses.
-fn fold_memory_available(
-    levels: &[MemoryLevel],
-    root: (u64, u64),
-    unit_current: Option<u64>,
-) -> Option<u64> {
+/// At a level with an unreadable current, reuse the current from the
+/// deeper level, starting at zero when no level has supplied one.
+fn fold_memory_available(levels: &[MemoryLevel], root: (u64, u64)) -> Option<u64> {
     let mut available = u64::MAX;
-    // systemd initialises `current = 0`, so a limit with no readable current
-    // anywhere constrains by the full limit rather than being skipped.
-    let mut current_fallback: Option<u64> = None;
-    for (index, level) in levels.iter().enumerate() {
-        // Level 0 prefers the join!-batch read over the walk's own copy.
-        let current = if index == 0 {
-            unit_current.or(level.current)
-        } else {
-            level.current
-        };
-        if let Some(current) = current {
-            current_fallback = Some(current);
-        }
-        let Some(limit) = level.limit else {
-            continue;
-        };
-        if let Some(current) = current_fallback {
+    let mut current = 0;
+    for level in levels {
+        current = level.current.unwrap_or(current);
+        if let Some(limit) = level.limit {
             available = available.min(limit.saturating_sub(current));
-            if available == 0 {
-                break;
-            }
-        } else {
-            available = available.min(limit);
-            if available == 0 {
-                break;
-            }
         }
     }
     let (root_limit, root_current) = root;
@@ -399,12 +373,10 @@ pub async fn read_host_memory() -> Option<HostMemory> {
 /// as infinity: `None` when both are unlimited, in which case the level
 /// constrains nothing (though its current still feeds the fallback for
 /// levels above — see `fold_memory_available`).
-async fn read_memory_level(dir: &str) -> MemoryLevel {
-    let (max, high, mem_current) = tokio::join!(
-        async { read_file(dir, "memory.max").await },
-        async { read_file(dir, "memory.high").await },
-        async { read_file(dir, "memory.current").await },
-    );
+fn read_memory_level(dir: &str) -> MemoryLevel {
+    let max = read_file(dir, "memory.max");
+    let high = read_file(dir, "memory.high");
+    let mem_current = read_file(dir, "memory.current");
     let limit = match (
         max.as_deref().and_then(parse_memory_limit),
         high.as_deref().and_then(parse_memory_limit),
@@ -418,40 +390,6 @@ async fn read_memory_level(dir: &str) -> MemoryLevel {
         limit,
         current: mem_current.as_deref().and_then(parse_u64),
     }
-}
-
-/// Read the unit's ancestor-slice `memory.max` / `memory.high` /
-/// `memory.current` triples for the `memory_available` fold, up to (but not
-/// past) the `fs_root`-prefixed mount root (`/system.slice/foo` ->
-/// `/system.slice`).
-///
-/// The walk stops at the prefixed root rather than continuing into host
-/// parents: a container's systemd only sees its own slice chain. systemd
-/// never consults the mount root's own files either — `-​-.slice` is
-/// special-cased to physical memory — so the cycle-shared host root level
-/// substitutes for it, which also avoids expected-miss log noise for files
-/// that never exist there. Ancestor directories are derived by popping path
-/// components, so a `..` in a hostile `cgroup_path` cannot escape the
-/// mount — it just yields nonexistent directories whose files read as
-/// absent. Levels are read sequentially (shallow tree, tiny files); the
-/// whole walk joins the unit-level batch in `read_service_cgroup`.
-async fn read_ancestor_levels(fs_root: &str, cgroup_path: &str) -> Vec<MemoryLevel> {
-    let mount = format!("{fs_root}/sys/fs/cgroup");
-    let mut levels = Vec::new();
-    let mut relative: &Path = Path::new(cgroup_path);
-    loop {
-        if relative.as_os_str() == "/" || relative.as_os_str().is_empty() {
-            break;
-        }
-        let dir = format!("{mount}{}", relative.display());
-        levels.push(read_memory_level(&dir).await);
-        match relative.parent() {
-            Some(parent) => relative = parent,
-            // `parent()` of `/` is `None`; the next loop test ends the walk.
-            _ => break,
-        }
-    }
-    levels
 }
 
 /// Count processes in a unit's cgroup, including nested ones.
@@ -548,7 +486,7 @@ mod tests {
         // (MemTotal, used = MemTotal − MemAvailable.)
         let root = (12_271_919_104, 8_474_013_504);
         assert_eq!(
-            fold_memory_available(&levels, root, Some(1_368_064)),
+            fold_memory_available(&levels, root),
             Some(536_870_912 - 1_368_064)
         );
     }
@@ -569,10 +507,7 @@ mod tests {
             },
         ];
         let root = (12_271_919_104, 3_761_983_488);
-        assert_eq!(
-            fold_memory_available(&levels, root, Some(4_227_072)),
-            Some(8_509_935_616)
-        );
+        assert_eq!(fold_memory_available(&levels, root), Some(8_509_935_616));
     }
 
     #[test]
@@ -589,10 +524,7 @@ mod tests {
             },
         ];
         let root = (12_271_919_104, 3_761_983_488);
-        assert_eq!(
-            fold_memory_available(&levels, root, Some(1_000_000)),
-            Some(10_000_000)
-        );
+        assert_eq!(fold_memory_available(&levels, root), Some(10_000_000));
     }
 
     #[test]
@@ -603,7 +535,7 @@ mod tests {
             current: Some(2_000),
         }];
         let root = (12_271_919_104, 3_761_983_488);
-        assert_eq!(fold_memory_available(&levels, root, Some(2_000)), Some(0));
+        assert_eq!(fold_memory_available(&levels, root), Some(0));
     }
 
     /// Build a fake cgroup tree under a temp dir shaped like
@@ -644,25 +576,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_memory_available_prefers_fresh_unit_current() {
-        // The join!-batch read (fresher) wins over the walk's level-0 copy.
-        let levels = vec![MemoryLevel {
-            limit: Some(536_870_912),
-            current: Some(1_000_000),
-        }];
-        let root = (12_271_919_104, 3_761_983_488);
-        assert_eq!(
-            fold_memory_available(&levels, root, Some(1_368_064)),
-            Some(536_870_912 - 1_368_064)
-        );
-        // …while a missing batch read falls back to the walk's copy.
-        assert_eq!(
-            fold_memory_available(&levels, root, None),
-            Some(536_870_912 - 1_000_000)
-        );
-    }
-
-    #[test]
     fn test_fold_memory_available_unreadable_current_constrains_in_full() {
         // systemd initialises `current = 0`: a limit with no readable
         // current anywhere constrains by the full limit (LESS_BY(limit, 0)),
@@ -674,10 +587,7 @@ mod tests {
         // The host root (netting to 8_509_935_616) binds above the unit
         // limit, so the unit's full limit wins.
         let root = (12_271_919_104, 3_761_983_488);
-        assert_eq!(
-            fold_memory_available(&levels, root, None),
-            Some(100_000_000)
-        );
+        assert_eq!(fold_memory_available(&levels, root), Some(100_000_000));
     }
 
     #[tokio::test]
@@ -697,6 +607,14 @@ mod tests {
         assert_eq!(stats.processes, 4);
         // Unit limit binds: 512M − current; the host root level is above it.
         assert_eq!(stats.memory_available, Some(536_870_912 - 1_368_064));
+
+        std::fs::remove_file(format!(
+            "{root}/sys/fs/cgroup/system.slice/fake.service/memory.current"
+        ))
+        .unwrap();
+        let stats = read_service_cgroup(&root, "/system.slice/fake.service", &[], host).await;
+        assert_eq!(stats.memory_current, None);
+        assert_eq!(stats.memory_available, None);
     }
 
     #[tokio::test]
