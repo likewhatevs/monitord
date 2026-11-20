@@ -844,13 +844,13 @@ pub async fn apply_unit_details(
         service_outputs.push((name.clone(), output, fetched_at));
     }
 
-    // Phase 2: read every service's cgroup files concurrently. No IPC here,
-    // just local filesystem reads, so all units go out in one batch.
-    // `host_memory` is read once here and shared by every service rather
-    // than once per service inside the reader.
+    // Limit concurrent service reads on Tokio's blocking pool. All services
+    // in this collection use the same host memory reading.
     let host_memory = crate::cgroup::read_host_memory().await;
-    let service_cgroups =
-        futures_util::future::join_all(service_outputs.iter().map(|(_, output, _)| {
+    let mut service_stats = HashMap::new();
+    let mut cached_services = HashMap::new();
+    let mut cgroups = futures_util::stream::iter(service_outputs)
+        .map(|(name, output, fetched_at)| async move {
             let cgroup_path = output
                 .runtime
                 .as_ref()
@@ -878,16 +878,13 @@ pub async fn apply_unit_details(
             .into_iter()
             .flatten()
             .collect();
-            async move {
+            let cgroup =
                 crate::cgroup::read_service_cgroup(fs_root, cgroup_path, &extra_pids, host_memory)
-                    .await
-            }
-        }))
-        .await;
-
-    let mut service_stats: HashMap<String, crate::units::ServiceStats> = HashMap::new();
-    let mut cached_services: HashMap<String, CachedService> = HashMap::new();
-    for ((name, output, fetched_at), cgroup) in service_outputs.into_iter().zip(service_cgroups) {
+                    .await;
+            (name, output, fetched_at, cgroup)
+        })
+        .buffer_unordered(8);
+    while let Some((name, output, fetched_at, cgroup)) = cgroups.next().await {
         service_stats.insert(
             name.clone(),
             crate::varlink_unit::map_service_stats(&output, &cgroup),
