@@ -905,9 +905,10 @@ pub async fn parse_unit_state(
     let host_memory = crate::cgroup::read_host_memory().await;
     let mut pending = listed_units.into_iter().map(|unit| {
         let config = Arc::clone(config);
-        let connection = connection.clone();
+        let manager = p.clone();
         let fs_root = fs_root.to_string();
         async move {
+            let connection = manager.inner().connection();
             let unit_collect_start = Instant::now();
             let span = tracing::debug_span!("unit_collect", unit = %unit.name);
             let mut outcome = async {
@@ -921,7 +922,7 @@ pub async fn parse_unit_state(
                 // is logged and skipped rather than aborting the whole
                 // collection cycle for every other unit.
                 if config.units.state_stats {
-                    match parse_state(&unit, &config.units, Some(&connection)).await {
+                    match parse_state(&unit, &config.units, Some(connection)).await {
                         Ok((did_fetch, entry)) => {
                             outcome.state_dbus_fetch = did_fetch;
                             outcome.unit_states_entry = entry;
@@ -936,7 +937,7 @@ pub async fn parse_unit_state(
                 if config.services.contains(&unit.name) {
                     debug!("Collecting service stats for {:?}", &unit);
                     match parse_service(
-                        &connection,
+                        connection,
                         &unit.name,
                         &unit.unit_object_path,
                         &fs_root,
@@ -959,7 +960,7 @@ pub async fn parse_unit_state(
                     && (config.timers.allowlist.is_empty()
                         || config.timers.allowlist.contains(&unit.name))
                 {
-                    match crate::timer::collect_timer_stats(&connection, &unit).await {
+                    match crate::timer::collect_timer_stats_with_manager(&manager, &unit).await {
                         Ok(ts) => outcome.timer_stats_entry = Some(ts),
                         Err(err) => error!("Failed to get {} stats: {:#?}", &unit.name, err),
                     }

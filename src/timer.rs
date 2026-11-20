@@ -46,37 +46,58 @@ pub struct TimerStats {
 
 pub const TIMER_STATS_FIELD_NAMES: &[&str] = &TimerStats::FIELD_NAMES_AS_ARRAY;
 
-#[tracing::instrument(level = "debug", skip(connection))]
 pub async fn collect_timer_stats(
     connection: &zbus::Connection,
     unit: &crate::units::ListedUnit,
 ) -> Result<TimerStats, MonitordTimerError> {
-    let mut timer_stats = TimerStats::default();
+    let manager = zbus_systemd::systemd1::ManagerProxy::builder(connection)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    collect_timer_stats_with_manager(&manager, unit).await
+}
 
-    let pt = zbus_systemd::systemd1::TimerProxy::builder(connection)
+async fn timer_property<T: TryFrom<zbus::OwnedVariant>>(
+    value: Option<zbus::OwnedVariant>,
+    fallback: impl std::future::Future<Output = zbus::Result<T>>,
+) -> zbus::Result<T> {
+    match value.and_then(|value| value.try_into().ok()) {
+        Some(value) => Ok(value),
+        None => fallback.await,
+    }
+}
+
+#[tracing::instrument(name = "collect_timer_stats", level = "debug", skip(manager))]
+pub(crate) async fn collect_timer_stats_with_manager(
+    manager: &zbus_systemd::systemd1::ManagerProxy<'_>,
+    unit: &crate::units::ListedUnit,
+) -> Result<TimerStats, MonitordTimerError> {
+    let connection = manager.inner().connection();
+    let timer = zbus_systemd::systemd1::TimerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .path(unit.unit_object_path.clone())
         .build()
         .await?;
-    // Get service unit name to check when it last ran to ensure
-    // we are triggers the configured service with times set
-    let service_unit = pt.unit().await?;
+    let mut values = zbus::fdo::PropertiesProxy::builder(connection)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .destination(timer.inner().destination())
+        .path(timer.inner().path())
+        .build()
+        .await?
+        .get_all(timer.inner().interface().as_ref())
+        .await
+        .unwrap_or_default();
+    let service_unit = timer_property(values.remove("Unit"), timer.unit()).await?;
+    let mut timer_stats = TimerStats::default();
     if service_unit.is_empty() {
         error!("{}: No service unit name found for timer.", unit.name);
     } else {
-        // Get the object path of the service unit
-        let mp = zbus_systemd::systemd1::ManagerProxy::builder(connection)
-            .cache_properties(zbus::proxy::CacheProperties::No)
-            .build()
-            .await?;
-        let service_unit_path = mp.get_unit(service_unit).await?;
-        // Create a UnitProxy with the unit path to async get the two counters we want
+        let service_unit_path = manager.get_unit(service_unit).await?;
         let up = zbus_systemd::systemd1::UnitProxy::builder(connection)
             .cache_properties(zbus::proxy::CacheProperties::No)
             .path(service_unit_path)
             .build()
             .await?;
-
         let (realtime, monotonic) = tokio::join!(
             up.state_change_timestamp(),
             up.state_change_timestamp_monotonic(),
@@ -85,8 +106,8 @@ pub async fn collect_timer_stats(
         timer_stats.service_unit_last_state_change_usec_monotonic = monotonic?;
     }
 
-    // Use tokio::join! without tokio::spawn to avoid per-task allocation overhead.
-    // These all share the same D-Bus connection so spawn adds no parallelism benefit.
+    // GetAll can omit properties or be denied outright. Issue any fallback
+    // Gets together, then report errors in property order.
     let (
         accuracy_usec,
         fixed_random_delay,
@@ -98,15 +119,33 @@ pub async fn collect_timer_stats(
         randomized_delay_usec,
         remain_after_elapse,
     ) = tokio::join!(
-        pt.accuracy_u_sec(),
-        pt.fixed_random_delay(),
-        pt.last_trigger_u_sec(),
-        pt.last_trigger_u_sec_monotonic(),
-        pt.persistent(),
-        pt.next_elapse_u_sec_monotonic(),
-        pt.next_elapse_u_sec_realtime(),
-        pt.randomized_delay_u_sec(),
-        pt.remain_after_elapse(),
+        timer_property(values.remove("AccuracyUSec"), timer.accuracy_u_sec()),
+        timer_property(
+            values.remove("FixedRandomDelay"),
+            timer.fixed_random_delay()
+        ),
+        timer_property(values.remove("LastTriggerUSec"), timer.last_trigger_u_sec()),
+        timer_property(
+            values.remove("LastTriggerUSecMonotonic"),
+            timer.last_trigger_u_sec_monotonic()
+        ),
+        timer_property(values.remove("Persistent"), timer.persistent()),
+        timer_property(
+            values.remove("NextElapseUSecMonotonic"),
+            timer.next_elapse_u_sec_monotonic()
+        ),
+        timer_property(
+            values.remove("NextElapseUSecRealtime"),
+            timer.next_elapse_u_sec_realtime()
+        ),
+        timer_property(
+            values.remove("RandomizedDelayUSec"),
+            timer.randomized_delay_u_sec()
+        ),
+        timer_property(
+            values.remove("RemainAfterElapse"),
+            timer.remain_after_elapse()
+        ),
     );
 
     timer_stats.accuracy_usec = accuracy_usec?;
@@ -124,6 +163,18 @@ pub async fn collect_timer_stats(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_timer_property_uses_get_for_missing_or_invalid_values() {
+        let cached = timer_property::<bool>(Some(false.into()), async { panic!("unexpected Get") });
+        assert!(!cached.await.unwrap());
+        let invalid = timer_property(Some(0u64.into()), async { Ok(true) });
+        assert!(invalid.await.unwrap());
+        let missing = timer_property::<u64>(None, async { Err(zbus::Error::IncorrectType) });
+        assert!(matches!(missing.await, Err(zbus::Error::IncorrectType)));
+    }
+
     #[test]
     fn test_only_timer_units_are_selected() {
         // Both collection paths pick timers out of a list of every unit, so the
