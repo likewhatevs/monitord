@@ -23,6 +23,24 @@ fn gen_base_metric_key(key_prefix: &str, metric_name: &str) -> String {
     }
 }
 
+/// Emit the numeric fields of a flat stats struct, with boolean gauges as 0/1.
+fn extend_flat_fields(
+    output: &mut impl Extend<(String, serde_json::Value)>,
+    prefix: &str,
+    stats: &impl serde::Serialize,
+) {
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(stats) {
+        output.extend(fields.into_iter().filter_map(|(field, value)| {
+            let value = match value {
+                serde_json::Value::Number(_) => value,
+                serde_json::Value::Bool(value) => u64::from(value).into(),
+                _ => return None,
+            };
+            Some((format!("{prefix}.{field}"), value))
+        }));
+    }
+}
+
 fn flatten_networkd(
     networkd_stats: &networkd::NetworkdState,
     key_prefix: &str,
@@ -43,34 +61,7 @@ fn flatten_networkd(
 
     for interface in &networkd_stats.interfaces_state {
         let interface_base = format!("{}.{}", base_metric_name, interface.name);
-        flat_stats.push((
-            format!("{interface_base}.address_state"),
-            (interface.address_state as u64).into(),
-        ));
-        flat_stats.push((
-            format!("{interface_base}.admin_state"),
-            (interface.admin_state as u64).into(),
-        ));
-        flat_stats.push((
-            format!("{interface_base}.carrier_state"),
-            (interface.carrier_state as u64).into(),
-        ));
-        flat_stats.push((
-            format!("{interface_base}.ipv4_address_state"),
-            (interface.ipv4_address_state as u64).into(),
-        ));
-        flat_stats.push((
-            format!("{interface_base}.ipv6_address_state"),
-            (interface.ipv6_address_state as u64).into(),
-        ));
-        flat_stats.push((
-            format!("{interface_base}.oper_state"),
-            (interface.oper_state as u64).into(),
-        ));
-        flat_stats.push((
-            format!("{interface_base}.required_for_online"),
-            (interface.required_for_online as u64).into(),
-        ));
+        extend_flat_fields(&mut flat_stats, &interface_base, interface);
     }
     flat_stats
 }
@@ -79,39 +70,22 @@ fn flatten_pid1(
     optional_pid1_stats: &Option<pid1::Pid1Stats>,
     key_prefix: &str,
 ) -> Vec<(String, serde_json::Value)> {
-    // If we're not collecting pid1 stats don't add
-    let pid1_stats = match optional_pid1_stats {
-        Some(ps) => ps,
-        None => {
-            debug!("Skipping flattening pid1 stats as we got None ...");
-            return Vec::new();
-        }
+    let Some(stats) = optional_pid1_stats else {
+        debug!("Skipping flattening pid1 stats as we got None ...");
+        return Vec::new();
     };
-
-    let base_metric_name = gen_base_metric_key(key_prefix, "pid1");
-
-    vec![
-        (
-            format!("{}.cpu_time_kernel", base_metric_name),
-            pid1_stats.cpu_time_kernel.into(),
-        ),
-        (
-            format!("{}.cpu_user_kernel", base_metric_name),
-            pid1_stats.cpu_time_user.into(),
-        ),
-        (
-            format!("{}.memory_usage_bytes", base_metric_name),
-            pid1_stats.memory_usage_bytes.into(),
-        ),
-        (
-            format!("{}.fd_count", base_metric_name),
-            pid1_stats.fd_count.into(),
-        ),
-        (
-            format!("{}.tasks", base_metric_name),
-            pid1_stats.tasks.into(),
-        ),
+    let base = gen_base_metric_key(key_prefix, "pid1");
+    [
+        ("cpu_time_kernel", stats.cpu_time_kernel),
+        // Keep the historical flat key for the cpu_time_user field.
+        ("cpu_user_kernel", stats.cpu_time_user),
+        ("memory_usage_bytes", stats.memory_usage_bytes),
+        ("fd_count", stats.fd_count),
+        ("tasks", stats.tasks),
     ]
+    .into_iter()
+    .map(|(field, value)| (format!("{base}.{field}"), value.into()))
+    .collect()
 }
 
 fn flatten_unit_files_scope(
@@ -176,18 +150,11 @@ fn flatten_unit_fields<T: serde::Serialize>(
     let base_metric_name = gen_base_metric_key(key_prefix, metric_name);
 
     for (unit_name, stats) in stats_by_unit {
-        let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(stats) else {
-            continue;
-        };
-        for (field_name, value) in fields {
-            let value = match value {
-                serde_json::Value::Number(_) => value,
-                serde_json::Value::Bool(b) => u64::from(b).into(),
-                _ => continue,
-            };
-            let key = format!("{base_metric_name}.{unit_name}.{field_name}");
-            flat_stats.push((key, value));
-        }
+        extend_flat_fields(
+            &mut flat_stats,
+            &format!("{base_metric_name}.{unit_name}"),
+            stats,
+        );
     }
     flat_stats
 }
@@ -357,28 +324,11 @@ fn flatten_dbus_stats(
 
     if let Some(cgroup_accounting) = dbus_stats.cgroup_accounting() {
         for cgroup in cgroup_accounting.values() {
-            let cgroup_name = &cgroup.name;
-            let cgroup_fields = [
-                ("name_objects", cgroup.name_objects),
-                ("match_bytes", cgroup.match_bytes),
-                ("matches", cgroup.matches),
-                ("reply_objects", cgroup.reply_objects),
-                ("incoming_bytes", cgroup.incoming_bytes),
-                ("incoming_fds", cgroup.incoming_fds),
-                ("outgoing_bytes", cgroup.outgoing_bytes),
-                ("outgoing_fds", cgroup.outgoing_fds),
-                ("activation_request_bytes", cgroup.activation_request_bytes),
-                ("activation_request_fds", cgroup.activation_request_fds),
-            ];
-
-            for (field_name, value) in cgroup_fields {
-                if let Some(val) = value {
-                    flat_stats.insert(
-                        format!("{base_metric_name}.cgroup.{cgroup_name}.{field_name}"),
-                        val.into(),
-                    );
-                }
-            }
+            extend_flat_fields(
+                &mut flat_stats,
+                &format!("{base_metric_name}.cgroup.{}", cgroup.name),
+                cgroup,
+            );
         }
     }
 
@@ -517,23 +467,7 @@ fn flatten_varlink_usage(
 ) -> BTreeMap<String, serde_json::Value> {
     let mut flat_stats: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let base_metric_name = gen_base_metric_key(key_prefix, "varlink_usage");
-    let fields: [(&str, Option<crate::CollectorTransport>); 7] = [
-        ("version", usage.version),
-        ("system_state", usage.system_state),
-        ("units", usage.units),
-        ("networkd", usage.networkd),
-        ("machines", usage.machines),
-        ("boot_blame", usage.boot_blame),
-        ("verify", usage.verify),
-    ];
-    for (name, transport) in fields {
-        if let Some(transport) = transport {
-            flat_stats.insert(
-                format!("{base_metric_name}.{name}"),
-                transport.as_u64().into(),
-            );
-        }
-    }
+    extend_flat_fields(&mut flat_stats, &base_metric_name, usage);
     flat_stats
 }
 
@@ -708,6 +642,16 @@ mod tests {
   "collector_timings.units.elapsed_ms": 42.0,
   "collector_timings.units.start_offset_ms": 0.5,
   "collector_timings.units.success": 1,
+  "dbus.cgroup.system.slice-sshd.service.activation_request_bytes": 8,
+  "dbus.cgroup.system.slice-sshd.service.activation_request_fds": 9,
+  "dbus.cgroup.system.slice-sshd.service.incoming_bytes": 5,
+  "dbus.cgroup.system.slice-sshd.service.incoming_fds": 6,
+  "dbus.cgroup.system.slice-sshd.service.match_bytes": 2,
+  "dbus.cgroup.system.slice-sshd.service.matches": 3,
+  "dbus.cgroup.system.slice-sshd.service.name_objects": 1,
+  "dbus.cgroup.system.slice-sshd.service.outgoing_bytes": 7,
+  "dbus.cgroup.system.slice-sshd.service.reply_objects": 4,
+  "dbus.cgroup.user.slice.outgoing_fds": 0,
   "machines.foo.collection_timings.list_units_ms": 0.0,
   "machines.foo.collection_timings.per_unit_loop_ms": 0.0,
   "machines.foo.collection_timings.service_dbus_fetches": 0,
@@ -877,7 +821,35 @@ mod tests {
                 .try_into()
                 .expect("Unable to make SystemdVersion struct"),
             machines: HashMap::from([(String::from("foo"), MachineStats::default())]),
-            dbus_stats: None,
+            dbus_stats: Some(dbus_stats::DBusStats {
+                dbus_broker_cgroup_accounting: Some(HashMap::from([
+                    (
+                        "system.slice-sshd.service".into(),
+                        dbus_stats::DBusBrokerCGroupAccounting {
+                            name: "system.slice-sshd.service".into(),
+                            name_objects: Some(1),
+                            match_bytes: Some(2),
+                            matches: Some(3),
+                            reply_objects: Some(4),
+                            incoming_bytes: Some(5),
+                            incoming_fds: Some(6),
+                            outgoing_bytes: Some(7),
+                            outgoing_fds: None,
+                            activation_request_bytes: Some(8),
+                            activation_request_fds: Some(9),
+                        },
+                    ),
+                    (
+                        "user.slice".into(),
+                        dbus_stats::DBusBrokerCGroupAccounting {
+                            name: "user.slice".into(),
+                            outgoing_fds: Some(0),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                ..Default::default()
+            }),
             boot_blame: None,
             verify_stats: Some(crate::verify::VerifyStats {
                 total: 3,
@@ -1200,7 +1172,7 @@ mod tests {
     #[test]
     fn test_flatten_map() {
         let json_flat_map = flatten_stats(&return_monitord_stats(), "");
-        assert_eq!(157, json_flat_map.len());
+        assert_eq!(167, json_flat_map.len());
     }
 
     #[test]
