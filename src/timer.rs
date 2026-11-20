@@ -61,8 +61,6 @@ pub async fn collect_timer_stats(
     // Get service unit name to check when it last ran to ensure
     // we are triggers the configured service with times set
     let service_unit = pt.unit().await?;
-    let mut service_unit_last_state_change_usec: Result<u64, zbus::Error> = Ok(0);
-    let mut service_unit_last_state_change_usec_monotonic: Result<u64, zbus::Error> = Ok(0);
     if service_unit.is_empty() {
         error!("{}: No service unit name found for timer.", unit.name);
     } else {
@@ -79,17 +77,13 @@ pub async fn collect_timer_stats(
             .build()
             .await?;
 
-        (
-            service_unit_last_state_change_usec,
-            service_unit_last_state_change_usec_monotonic,
-        ) = tokio::join!(
+        let (realtime, monotonic) = tokio::join!(
             up.state_change_timestamp(),
             up.state_change_timestamp_monotonic(),
         );
+        timer_stats.service_unit_last_state_change_usec = realtime?;
+        timer_stats.service_unit_last_state_change_usec_monotonic = monotonic?;
     }
-    timer_stats.service_unit_last_state_change_usec = service_unit_last_state_change_usec?;
-    timer_stats.service_unit_last_state_change_usec_monotonic =
-        service_unit_last_state_change_usec_monotonic?;
 
     // Use tokio::join! without tokio::spawn to avoid per-task allocation overhead.
     // These all share the same D-Bus connection so spawn adds no parallelism benefit.

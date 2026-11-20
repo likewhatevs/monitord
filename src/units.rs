@@ -394,6 +394,16 @@ pub const SERVICE_FIELD_NAMES: &[&str] = &ServiceStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_FIELD_NAMES: &[&str] = &SystemdUnitStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_STATES_FIELD_NAMES: &[&str] = &UnitStates::FIELD_NAMES_AS_ARRAY;
 
+async fn cgroup_or_dbus(
+    value: Option<u64>,
+    property: impl std::future::Future<Output = zbus::Result<u64>>,
+) -> zbus::Result<u64> {
+    match value {
+        Some(value) => Ok(value),
+        None => property.await,
+    }
+}
+
 /// Pull out selected systemd service statistics
 ///
 /// The seven cgroup-derived fields (`cpuusage_nsec`, `ioread_bytes`,
@@ -433,9 +443,9 @@ async fn parse_service(
     // These all share the same D-Bus connection so spawn adds no parallelism benefit.
     let (control_group, main_pid, control_pid) =
         tokio::join!(sp.control_group(), sp.main_pid(), sp.control_pid());
-    let (control_group, main_pid, control_pid) = (control_group?, main_pid?, control_pid?);
+    let control_group = control_group?;
     let mut extra_pids = Vec::with_capacity(2);
-    for pid in [main_pid, control_pid] {
+    for pid in [main_pid?, control_pid?] {
         if pid != 0 {
             extra_pids.push(pid);
         }
@@ -472,12 +482,8 @@ async fn parse_service(
         cgroup_stats,
     );
 
-    // Per-field D-Bus fallback for whatever cgroupfs had no data for: only
-    // missing fields pay for a fallback call, in the same single batch — so
-    // the hot path (cgroup present, the common case for running services)
-    // issues none, and a property that errors only fails its own field via
-    // the `?` below rather than the whole service (matching how a missing
-    // cgroup file behaves).
+    // Poll D-Bus properties only for counters missing from cgroupfs.
+    // Finish the batch before returning the first error in field order.
     let (
         cpuusage_nsec,
         ioread_bytes,
@@ -486,74 +492,28 @@ async fn parse_service(
         memory_available,
         tasks_current,
     ) = tokio::join!(
-        async {
-            match cgroup_stats.cpu_usage_nsec {
-                Some(value) => Ok(value),
-                None => sp.cpu_usage_n_sec().await,
-            }
-        },
-        async {
-            match cgroup_stats.io_read_bytes {
-                Some(value) => Ok(value),
-                None => sp.io_read_bytes().await,
-            }
-        },
-        async {
-            match cgroup_stats.io_read_operations {
-                Some(value) => Ok(value),
-                None => sp.io_read_operations().await,
-            }
-        },
-        async {
-            match cgroup_stats.memory_current {
-                Some(value) => Ok(value),
-                None => sp.memory_current().await,
-            }
-        },
-        async {
-            match cgroup_stats.memory_available {
-                Some(value) => Ok(value),
-                None => sp.memory_available().await,
-            }
-        },
-        async {
-            match cgroup_stats.tasks_current {
-                Some(value) => Ok(value),
-                None => sp.tasks_current().await,
-            }
-        },
+        cgroup_or_dbus(cgroup_stats.cpu_usage_nsec, sp.cpu_usage_n_sec()),
+        cgroup_or_dbus(cgroup_stats.io_read_bytes, sp.io_read_bytes()),
+        cgroup_or_dbus(cgroup_stats.io_read_operations, sp.io_read_operations()),
+        cgroup_or_dbus(cgroup_stats.memory_current, sp.memory_current()),
+        cgroup_or_dbus(cgroup_stats.memory_available, sp.memory_available()),
+        cgroup_or_dbus(cgroup_stats.tasks_current, sp.tasks_current()),
     );
-    let (
-        cpuusage_nsec,
-        ioread_bytes,
-        ioread_operations,
-        memory_current,
-        memory_available,
-        tasks_current,
-    ) = (
-        cpuusage_nsec?,
-        ioread_bytes?,
-        ioread_operations?,
-        memory_current?,
-        memory_available?,
-        tasks_current?,
-    );
-
     Ok(ServiceStats {
+        cpuusage_nsec: cpuusage_nsec?,
+        ioread_bytes: ioread_bytes?,
+        ioread_operations: ioread_operations?,
+        memory_current: memory_current?,
+        memory_available: memory_available?,
+        tasks_current: tasks_current?,
         active_enter_timestamp: active_enter_timestamp?,
         active_exit_timestamp: active_exit_timestamp?,
-        cpuusage_nsec,
         inactive_exit_timestamp: inactive_exit_timestamp?,
-        ioread_bytes,
-        ioread_operations,
-        memory_current,
-        memory_available,
         nrestarts: nrestarts?,
         processes: cgroup_stats.processes,
         restart_usec: restart_usec?,
         state_change_timestamp: state_change_timestamp?,
         status_errno: status_errno?,
-        tasks_current,
         timeout_clean_usec: timeout_clean_usec?,
         watchdog_usec: watchdog_usec?,
     })
@@ -1097,6 +1057,13 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use strum::IntoEnumIterator;
+
+    #[tokio::test]
+    async fn test_cgroup_counter_only_polls_dbus_if_missing() {
+        let counter = cgroup_or_dbus(Some(0), async { panic!("unexpected D-Bus call") }).await;
+        assert_eq!(counter.unwrap(), 0);
+        assert_eq!(cgroup_or_dbus(None, async { Ok(17) }).await.unwrap(), 17);
+    }
 
     fn get_unit_file() -> ListedUnit {
         ListedUnit {
