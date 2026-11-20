@@ -138,7 +138,7 @@ pub struct Timestamp {
 
 /// cgroup accounting for a unit. Fields appear only when the matching
 /// accounting option is enabled for the unit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CGroupRuntime {
     /// cgroup path, relative to the cgroup mount point.
     #[serde(rename = "Path")]
