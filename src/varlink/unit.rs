@@ -41,12 +41,27 @@ pub struct ListOutput {
 /// Configuration of a unit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitContext {
+    /// Set for transient units, which can be recreated under the same name without a reload.
+    #[serde(
+        rename = "Transient",
+        default,
+        deserialize_with = "optional_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transient: Option<bool>,
     #[serde(rename = "Service")]
     pub service: Option<ServiceContext>,
     #[serde(rename = "Exec")]
     pub exec: Option<ExecContext>,
     #[serde(rename = "Timer")]
     pub timer: Option<TimerContext>,
+}
+
+// An unknown persistence flag makes the reply unsuitable for caching.
+fn optional_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool())
 }
 
 /// Execution configuration shared by every unit type that runs processes.
