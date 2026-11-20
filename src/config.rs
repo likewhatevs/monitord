@@ -7,6 +7,7 @@ use configparser::ini::Ini;
 use indexmap::map::IndexMap;
 use int_enum::IntEnum;
 use smart_default::SmartDefault;
+use struct_field_names_as_array::FieldNamesAsSlice;
 use strum_macros::EnumString;
 use thiserror::Error;
 use tracing::{error, warn};
@@ -43,7 +44,7 @@ pub enum MonitordOutputFormat {
     JsonPretty = 2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct MonitordConfig {
     #[default(crate::DEFAULT_DBUS_ADDRESS.into())]
     pub dbus_address: String,
@@ -56,7 +57,7 @@ pub struct MonitordConfig {
     pub dbus_timeout: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct NetworkdConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
@@ -68,13 +69,13 @@ pub struct NetworkdConfig {
     pub link_state_dir: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct Pid1Config {
     #[default = true]
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct SystemStateConfig {
     #[default = true]
     pub enabled: bool,
@@ -86,15 +87,17 @@ pub struct SystemStateConfig {
     pub varlink: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct TimersConfig {
     #[default = true]
     pub enabled: bool,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct UnitsConfig {
     #[default = true]
     pub enabled: bool,
@@ -105,13 +108,17 @@ pub struct UnitsConfig {
     pub varlink: bool,
     /// Unit-name patterns for failed counts, keyed by family. Each pattern
     /// matches a full name or contains one `*` matching a non-empty string.
+    #[field_names_as_slice(skip)]
     pub failed_families: BTreeMap<String, String>,
     pub state_stats: bool,
+    #[field_names_as_slice(skip)]
     pub state_stats_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub state_stats_blocklist: HashSet<String>,
     #[default = true]
     pub state_stats_time_in_state: bool,
     /// Host unit names mapped to their health grace period from boot, in seconds.
+    #[field_names_as_slice(skip)]
     pub boot_grace: BTreeMap<String, u64>,
     #[default = true]
     pub ignore_inactive_oneshot_services: bool,
@@ -136,7 +143,7 @@ pub struct UnitsConfig {
     pub service_details_cache_max_age_secs: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct MachinesConfig {
     #[default = true]
     pub enabled: bool,
@@ -148,11 +155,13 @@ pub struct MachinesConfig {
     /// `crate::varlink::machine_connector`), which needs `CAP_SYS_ADMIN`.
     #[default = true]
     pub varlink: bool,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct DBusStatsConfig {
     #[default = true]
     pub enabled: bool,
@@ -160,12 +169,16 @@ pub struct DBusStatsConfig {
     pub stale_fd_stats: bool,
 
     pub user_stats: bool,
+    #[field_names_as_slice(skip)]
     pub user_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub user_blocklist: HashSet<String>,
 
     pub peer_stats: bool,
     pub peer_well_known_names_only: bool,
+    #[field_names_as_slice(skip)]
     pub peer_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub peer_blocklist: HashSet<String>,
     /// Max number of well-known bus names whose owner lookup runs concurrently
     /// when resolving peer names. Bounded (rather than unbounded) for the same
@@ -175,11 +188,13 @@ pub struct DBusStatsConfig {
     pub peer_name_concurrency: u64,
 
     pub cgroup_stats: bool,
+    #[field_names_as_slice(skip)]
     pub cgroup_allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub cgroup_blocklist: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct BootBlameConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
@@ -193,11 +208,13 @@ pub struct BootBlameConfig {
     pub cache_dir: String,
     #[default = 5]
     pub num_slowest_units: u64,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
+#[derive(Clone, Debug, Eq, FieldNamesAsSlice, PartialEq, SmartDefault)]
 pub struct VerifyConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
@@ -205,11 +222,13 @@ pub struct VerifyConfig {
     /// D-Bus while the rest move to varlink.
     #[default = true]
     pub varlink: bool,
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, FieldNamesAsSlice, PartialEq)]
 pub struct VarlinkConfig {
     /// Global varlink master switch. Each varlink-capable collector section
     /// has its own `varlink` opt-out; a collector uses varlink only when
@@ -243,7 +262,7 @@ pub struct ReportCommand {
 /// `systemd-report` over `io.systemd.Metrics` (see `crate::report`), and
 /// collect other systemd-report sources (`/run/systemd/report/*`, systemd
 /// v260+) and configured commands (see `crate::report_collector`).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, FieldNamesAsSlice, PartialEq)]
 pub struct ReportConfig {
     /// Serve `io.systemd.Metrics` on `/run/systemd/report/io.monitord`
     /// (or a socket-activated fd). Off by default. The binary serves only
@@ -256,8 +275,10 @@ pub struct ReportConfig {
     pub collect: bool,
     /// Only collect these socket sources (e.g. `io.systemd.Basic`).
     /// Lowercased by the INI parser, so matched case-insensitively.
+    #[field_names_as_slice(skip)]
     pub allowlist: HashSet<String>,
     /// Never collect these socket sources. Matched case-insensitively.
+    #[field_names_as_slice(skip)]
     pub blocklist: HashSet<String>,
     /// Never collect these metrics, from any source: full metric names
     /// (e.g. `io.systemd.Basic.MachineID`), each also matching every name
@@ -265,9 +286,11 @@ pub struct ReportConfig {
     /// `io.systemd.Basic.SMBIOS.SystemVendor`). Lowercased by the INI
     /// parser, so matched case-insensitively. The example monitord.conf
     /// lists host identifiers here; see the README for why.
+    #[field_names_as_slice(skip)]
     pub metric_blocklist: HashSet<String>,
     /// Explicit command sources, keyed by lowercased interface name. Socket
     /// source filters do not apply to these opt-in sources.
+    #[field_names_as_slice(skip)]
     pub commands: BTreeMap<String, ReportCommand>,
 }
 
@@ -591,67 +614,25 @@ impl TryFrom<Ini> for Config {
     }
 }
 
-/// Fixed-key sections and every key monitord reads from each.
+/// Fixed INI keys come from the config fields. Fields loaded from their own
+/// data sections are skipped in the derive.
 ///
 /// Data sections (`[services]`, `*.allowlist`, `*.blocklist`) take arbitrary
 /// entries and are exempt; anything else unknown is warned about so a typo'd
 /// key parses loudly instead of silently doing nothing.
 const KNOWN_SECTION_KEYS: &[(&str, &[&str])] = &[
-    (
-        "monitord",
-        &[
-            "dbus_address",
-            "dbus_timeout",
-            "daemon",
-            "daemon_stats_refresh_secs",
-            "key_prefix",
-            "output_format",
-        ],
-    ),
-    ("networkd", &["enabled", "varlink", "link_state_dir"]),
-    ("pid1", &["enabled"]),
-    ("system-state", &["enabled", "varlink"]),
-    ("timers", &["enabled"]),
-    (
-        "units",
-        &[
-            "enabled",
-            "varlink",
-            "state_stats",
-            "state_stats_time_in_state",
-            "ignore_inactive_oneshot_services",
-            "unit_files",
-            "per_unit_concurrency",
-            "slowest_units_count",
-            "service_details_cache_max_age_secs",
-        ],
-    ),
-    ("machines", &["enabled", "varlink"]),
-    (
-        "dbus",
-        &[
-            "enabled",
-            "stale_fd_stats",
-            "user_stats",
-            "peer_stats",
-            "peer_well_known_names_only",
-            "peer_name_concurrency",
-            "cgroup_stats",
-        ],
-    ),
-    (
-        "boot",
-        &[
-            "enabled",
-            "varlink",
-            "cache_enabled",
-            "cache_dir",
-            "num_slowest_units",
-        ],
-    ),
-    ("verify", &["enabled", "varlink"]),
-    ("varlink", &["enabled", "no_fallback"]),
-    ("report", &["enabled", "collect"]),
+    ("monitord", MonitordConfig::FIELD_NAMES_AS_SLICE),
+    ("networkd", NetworkdConfig::FIELD_NAMES_AS_SLICE),
+    ("pid1", Pid1Config::FIELD_NAMES_AS_SLICE),
+    ("system-state", SystemStateConfig::FIELD_NAMES_AS_SLICE),
+    ("timers", TimersConfig::FIELD_NAMES_AS_SLICE),
+    ("units", UnitsConfig::FIELD_NAMES_AS_SLICE),
+    ("machines", MachinesConfig::FIELD_NAMES_AS_SLICE),
+    ("dbus", DBusStatsConfig::FIELD_NAMES_AS_SLICE),
+    ("boot", BootBlameConfig::FIELD_NAMES_AS_SLICE),
+    ("verify", VerifyConfig::FIELD_NAMES_AS_SLICE),
+    ("varlink", VarlinkConfig::FIELD_NAMES_AS_SLICE),
+    ("report", ReportConfig::FIELD_NAMES_AS_SLICE),
 ];
 
 /// Sections whose entries are data (unit/machine names), not fixed keys.
@@ -1119,6 +1100,10 @@ output_format = json
 
 [units]
 varlnik = false
+failed_families = ignored
+
+[units.failed_families]
+worker = worker@*.service
 
 [timers]
 varlink = false
@@ -1135,7 +1120,8 @@ key = value
         assert!(unknown.contains(&"unknown key 'varlnik' in [units]".to_string()));
         assert!(unknown.contains(&"unknown key 'varlink' in [timers]".to_string()));
         assert!(unknown.contains(&"unknown section [bogus]".to_string()));
-        assert_eq!(unknown.len(), 3);
+        assert!(unknown.contains(&"unknown key 'failed_families' in [units]".to_string()));
+        assert_eq!(unknown.len(), 4);
     }
 
     #[test]
