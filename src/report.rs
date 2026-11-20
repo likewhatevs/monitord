@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -360,13 +361,53 @@ pub fn take_activation_fd() -> Option<OwnedFd> {
     Some(fd)
 }
 
+/// Probe a Unix socket without blocking when its accept queue is full.
+fn probe_socket(path: &Path) -> std::io::Result<()> {
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socket returned a new descriptor, owned only here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: an all-zero sockaddr_un is valid before filling its fields.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Unix socket path",
+        ));
+    }
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *byte as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    // SAFETY: address is initialized and len includes its NUL-terminated path.
+    let result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            len as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Bind `path`, replacing a socket file only if nobody is serving on it.
 ///
-/// Binding first means a live listener's file is never unlinked: only on
-/// `AddrInUse` is the existing file probed. A refused connection means it
-/// is stale (its owner died without removing it) and it is replaced; a
-/// connection that succeeds means another monitord, or
-/// `monitord-report.socket`, is serving there and this one backs off.
+/// Only probe after `AddrInUse`. A refused connection means the socket is
+/// stale; a successful connection or a full accept queue means it is live.
 /// Anything that isn't a socket is left alone.
 fn bind_unless_served(path: &Path) -> anyhow::Result<zlink::tokio::unix::Listener> {
     match zlink::tokio::unix::bind(path) {
@@ -381,9 +422,13 @@ fn bind_unless_served(path: &Path) -> anyhow::Result<zlink::tokio::unix::Listene
             path.display()
         );
     }
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => anyhow::bail!(
+    match probe_socket(path) {
+        Ok(()) => anyhow::bail!(
             "{} is already being served (another monitord or monitord-report.socket)",
+            path.display()
+        ),
+        Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => anyhow::bail!(
+            "{} is already being served (its accept queue is full)",
             path.display()
         ),
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -695,6 +740,31 @@ mod tests {
         // The first listener's socket file is still there and still answers.
         std::os::unix::net::UnixStream::connect(dir.path().join(REPORT_SOCKET_NAME))
             .expect("original listener still reachable");
+    }
+
+    #[test]
+    fn test_self_bind_refuses_a_full_accept_queue_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REPORT_SOCKET_NAME);
+        let serving = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(serving.as_raw_fd(), 0) }, 0);
+        let _queued = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let err = runtime.block_on(async { bind_unless_served(&probe_path).unwrap_err() });
+            tx.send(err.to_string()).unwrap();
+        });
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("probe blocked on a full backlog");
+        assert!(error.contains("already being served"), "{error}");
+        assert!(path.exists());
+        thread.join().unwrap();
     }
 
     #[tokio::test]
