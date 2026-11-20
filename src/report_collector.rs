@@ -23,6 +23,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::warn;
 
+use crate::config::ReportConfig;
 use crate::varlink::metrics::{ListOutput, Metrics, MetricsError};
 use crate::MonitordStats;
 
@@ -380,12 +381,10 @@ async fn list_source(path: PathBuf, timeout: Duration) -> anyhow::Result<Vec<Lis
 /// reported with `up: false` and never fails the collector.
 pub async fn collect_report_stats(
     dir: &Path,
-    allowlist: &HashSet<String>,
-    blocklist: &HashSet<String>,
-    metric_blocklist: &HashSet<String>,
+    config: &ReportConfig,
     timeout: Duration,
 ) -> anyhow::Result<ReportStats> {
-    let sources = list_sources(dir, allowlist, blocklist).await?;
+    let sources = list_sources(dir, &config.allowlist, &config.blocklist).await?;
     let results = futures_util::future::join_all(
         sources
             .iter()
@@ -396,7 +395,7 @@ pub async fn collect_report_stats(
     let mut stats = ReportStats::new();
     for (source, result) in sources.into_iter().zip(results) {
         let report_source = match result {
-            Ok(metrics) => normalize_metrics(&source, &metrics, metric_blocklist),
+            Ok(metrics) => normalize_metrics(&source, &metrics, &config.metric_blocklist),
             Err(err) => {
                 warn!("Unable to collect report source {}: {:#}", source, err);
                 ReportSource::default()
@@ -414,9 +413,7 @@ pub async fn update_report_stats(
 ) -> anyhow::Result<()> {
     let stats = collect_report_stats(
         Path::new(REPORT_DIR),
-        &config.report.allowlist,
-        &config.report.blocklist,
-        &config.report.metric_blocklist,
+        &config.report,
         Duration::from_secs(config.monitord.dbus_timeout),
     )
     .await?;
@@ -819,9 +816,8 @@ mod tests {
         // A socket file nobody listens on: connect is refused
         drop(std::os::unix::net::UnixListener::bind(dir.path().join("io.example.Dead")).unwrap());
 
-        let empty = HashSet::new();
         let stats =
-            collect_report_stats(dir.path(), &empty, &empty, &empty, Duration::from_secs(5))
+            collect_report_stats(dir.path(), &ReportConfig::default(), Duration::from_secs(5))
                 .await
                 .unwrap();
         server.await.expect("server");
