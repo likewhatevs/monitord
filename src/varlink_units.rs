@@ -351,17 +351,9 @@ const MAX_CACHED_ENDPOINTS: usize = 64;
 ///
 /// A process static because the exporter calls `stat_collector` once per scrape,
 /// so nothing owned by that call would outlive a cycle.
-#[derive(Debug)]
+#[derive(Debug, smart_default::SmartDefault)]
 struct ReloadCache<V> {
     endpoints: HashMap<String, (u64, HashMap<String, V>)>,
-}
-
-impl<V> Default for ReloadCache<V> {
-    fn default() -> Self {
-        Self {
-            endpoints: HashMap::new(),
-        }
-    }
 }
 
 /// Oneshot verdicts. The oneshot override wants `Service.Type` for every
