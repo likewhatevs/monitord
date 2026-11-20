@@ -2556,6 +2556,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::active,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: false,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2566,6 +2567,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: true,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2576,6 +2578,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::masked,
                 unhealthy: false,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2586,6 +2589,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: true,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2606,6 +2610,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: true,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2615,6 +2620,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: true,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2625,6 +2631,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: true,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );
@@ -2669,6 +2676,7 @@ mod tests {
                 active_state: SystemdUnitActiveState::inactive,
                 load_state: SystemdUnitLoadState::loaded,
                 unhealthy: true,
+                unhealthy_post_grace: None,
                 time_in_state_usecs: None,
             },
         );

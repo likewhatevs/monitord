@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -253,10 +254,43 @@ pub struct UnitStates {
     /// Masked units are never marked unhealthy since masking is an intentional admin action.
     /// Optional config can ignore inactive oneshot services.
     pub unhealthy: bool,
+    /// Host-only health after the configured grace period from boot has elapsed.
+    /// Absent without grace configuration or when host uptime cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unhealthy_post_grace: Option<bool>,
     /// Microseconds elapsed since the unit's most recent state change.
     /// None when time-in-state tracking is disabled in config (expensive D-Bus
     /// lookup per unit), or when no state change timestamp is known.
     pub time_in_state_usecs: Option<u64>,
+}
+
+/// Publish a copy of the raw host sample with boot grace applied to configured units.
+pub(crate) fn host_unit_snapshot(
+    raw: &SystemdUnitStats,
+    grace: &BTreeMap<String, u64>,
+    uptime: Option<Duration>,
+) -> SystemdUnitStats {
+    let mut stats = raw.clone();
+    if let Some(uptime) = uptime {
+        for (name, seconds) in grace {
+            if let Some(state) = stats.unit_states.get_mut(name) {
+                state.unhealthy_post_grace =
+                    Some(state.unhealthy && uptime > Duration::from_secs(*seconds));
+            }
+        }
+    }
+    stats
+}
+
+fn parse_boot_uptime(contents: &str) -> Option<Duration> {
+    let seconds = contents.split_whitespace().next()?.parse::<f64>().ok()?;
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
+/// `/proc/uptime` includes time suspended; read it once for the host sample.
+pub(crate) async fn read_boot_uptime() -> Option<Duration> {
+    let contents = tokio::fs::read_to_string("/proc/uptime").await.ok()?;
+    parse_boot_uptime(&contents)
 }
 
 // Declare state types
@@ -588,6 +622,7 @@ pub async fn parse_state(
     let entry = UnitStates {
         active_state,
         load_state,
+        unhealthy_post_grace: None,
         unhealthy: is_unit_unhealthy_for_service(
             active_state,
             load_state,
@@ -1100,6 +1135,7 @@ mod tests {
                     active_state: SystemdUnitActiveState::inactive,
                     load_state: SystemdUnitLoadState::loaded,
                     unhealthy: true,
+                    unhealthy_post_grace: None,
                     time_in_state_usecs: None,
                 },
             )]),
@@ -1148,6 +1184,93 @@ mod tests {
         // Blocklist short-circuit must NOT count as a D-Bus fetch.
         assert!(!did_fetch);
         Ok(())
+    }
+
+    #[test]
+    fn test_boot_grace_boundaries_missing_data_and_republished_states() {
+        let grace = BTreeMap::from([
+            ("failed.service".into(), 120),
+            ("healthy.service".into(), 0),
+            ("absent.service".into(), 0),
+        ]);
+        let raw = SystemdUnitStats {
+            unit_states: HashMap::from([
+                (
+                    "failed.service".into(),
+                    UnitStates {
+                        unhealthy: true,
+                        ..Default::default()
+                    },
+                ),
+                ("healthy.service".into(), UnitStates::default()),
+                (
+                    "unconfigured.service".into(),
+                    UnitStates {
+                        unhealthy: true,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        for (uptime, expected) in [
+            (Duration::from_millis(119_999), false),
+            (Duration::from_secs(120), false),
+            (Duration::from_millis(120_001), true),
+        ] {
+            // Re-publish unchanged raw host states, as on a failed listing.
+            let published = host_unit_snapshot(&raw, &grace, Some(uptime));
+            assert_eq!(
+                published.unit_states["failed.service"].unhealthy_post_grace,
+                Some(expected)
+            );
+            assert!(published.unit_states["failed.service"].unhealthy);
+            assert_eq!(
+                published.unit_states["healthy.service"].unhealthy_post_grace,
+                Some(false)
+            );
+            assert_eq!(
+                published.unit_states["unconfigured.service"].unhealthy_post_grace,
+                None
+            );
+            assert!(!published.unit_states.contains_key("absent.service"));
+            let published = host_unit_snapshot(&raw, &grace, None);
+            assert!(published
+                .unit_states
+                .values()
+                .all(|state| state.unhealthy_post_grace.is_none()));
+        }
+        assert!(raw
+            .unit_states
+            .values()
+            .all(|state| state.unhealthy_post_grace.is_none()));
+        let zero_grace = BTreeMap::from([("failed.service".into(), 0)]);
+        let published = host_unit_snapshot(&raw, &zero_grace, Some(Duration::ZERO));
+        assert_eq!(
+            published.unit_states["failed.service"].unhealthy_post_grace,
+            Some(false)
+        );
+        let published = host_unit_snapshot(&raw, &zero_grace, Some(Duration::from_millis(1)));
+        assert_eq!(
+            published.unit_states["failed.service"].unhealthy_post_grace,
+            Some(true)
+        );
+        let published = host_unit_snapshot(&raw, &BTreeMap::new(), Some(Duration::from_secs(1)));
+        assert_eq!(
+            published.unit_states["failed.service"].unhealthy_post_grace,
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_boot_uptime() {
+        assert_eq!(
+            parse_boot_uptime("120.25 200.12\n"),
+            Some(Duration::from_millis(120250))
+        );
+        for invalid in ["", "oops 1", "-1 1", "NaN 1", "inf 1"] {
+            assert_eq!(parse_boot_uptime(invalid), None);
+        }
     }
 
     #[test]

@@ -141,6 +141,8 @@ pub struct UnitsConfig {
     pub state_stats_allowlist: HashSet<String>,
     pub state_stats_blocklist: HashSet<String>,
     pub state_stats_time_in_state: bool,
+    /// Host unit names mapped to their health grace period from boot, in seconds.
+    pub boot_grace: BTreeMap<String, u64>,
     pub ignore_inactive_oneshot_services: bool,
     pub unit_files: bool,
     /// Max number of units whose D-Bus work runs concurrently in the per-unit
@@ -168,6 +170,7 @@ impl Default for UnitsConfig {
             state_stats_allowlist: HashSet::new(),
             state_stats_blocklist: HashSet::new(),
             state_stats_time_in_state: true,
+            boot_grace: BTreeMap::new(),
             ignore_inactive_oneshot_services: true,
             unit_files: true,
             per_unit_concurrency: 8,
@@ -367,6 +370,33 @@ impl Config {
     }
 }
 
+// Match the plain, instance and template names accepted by systemd.
+fn valid_unit_name(unit: &str) -> bool {
+    const UNIT_TYPES: &[&str] = &[
+        "automount",
+        "device",
+        "mount",
+        "path",
+        "scope",
+        "service",
+        "slice",
+        "socket",
+        "swap",
+        "target",
+        "timer",
+    ];
+    let Some((name, suffix)) = unit.rsplit_once('.') else {
+        return false;
+    };
+    unit.len() <= 255
+        && !name.is_empty()
+        && !name.starts_with('@')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || br":-_.\@".contains(&b))
+        && UNIT_TYPES.contains(&suffix)
+}
+
 impl TryFrom<Ini> for Config {
     type Error = MonitordConfigError;
 
@@ -468,6 +498,29 @@ impl TryFrom<Ini> for Config {
                 .keys()
                 .map(|s| s.to_string())
                 .collect();
+        }
+        if let Some(entries) = config_map.get("units.state_stats.boot_grace") {
+            for (label, value) in entries {
+                let invalid = || MonitordConfigError::InvalidValue {
+                    section: "units.state_stats.boot_grace".into(),
+                    key: label.clone(),
+                    reason: "expected <full unit name>,<non-negative integer seconds>".into(),
+                };
+                let (unit, seconds) = value
+                    .as_deref()
+                    .and_then(|value| value.rsplit_once(','))
+                    .ok_or_else(invalid)?;
+                let unit = unit.trim();
+                let seconds = seconds.trim();
+                if !valid_unit_name(unit)
+                    || seconds.is_empty()
+                    || !seconds.bytes().all(|c| c.is_ascii_digit())
+                {
+                    return Err(invalid());
+                }
+                let seconds = seconds.parse().map_err(|_| invalid())?;
+                config.units.boot_grace.insert(unit.into(), seconds);
+            }
         }
         config.units.state_stats_time_in_state =
             read_config_bool(&ini_config, "units", "state_stats_time_in_state")?;
@@ -695,6 +748,7 @@ const DATA_SECTIONS: &[&str] = &[
     "units.failed_families",
     "units.state_stats.allowlist",
     "units.state_stats.blocklist",
+    "units.state_stats.boot_grace",
     "machines.allowlist",
     "machines.blocklist",
     "dbus.user.allowlist",
@@ -829,6 +883,9 @@ service_details_cache_max_age_secs = 600
 
 [units.failed_families]
 Worker = Worker@*.service
+
+[units.state_stats.boot_grace]
+Blue = Database@Blue.service,240
 
 [units.state_stats.allowlist]
 foo.service
@@ -969,6 +1026,70 @@ output_format = json-flat
         assert!(expected_config.units.ignore_inactive_oneshot_services);
         // The systemd-report server is opt-in
         assert!(!expected_config.report.enabled);
+    }
+
+    #[test]
+    fn test_boot_grace_values_validate_at_load() {
+        for value in [
+            "",
+            "sshd.service",
+            ",2",
+            "sshd,2",
+            "sshd.sevrice,120",
+            "bad?.service,120",
+            "@.service,120",
+            "unit,name.service,10",
+            &format!("{}.service,0", "a".repeat(248)),
+            "sshd.service,-1",
+            "sshd.service,1.5",
+            "sshd.service,+1",
+            "sshd.service,18446744073709551616",
+            "sshd.service,no",
+            "bad unit.service,1",
+            "sshd.service,",
+        ] {
+            let invalid_config = format!(
+                r###"
+[monitord]
+output_format = json
+
+[units.state_stats.boot_grace]
+unit = {value}
+"###
+            );
+            let ini_config = load_ini(&invalid_config);
+            assert!(
+                matches!(
+                    Config::try_from(ini_config),
+                    Err(MonitordConfigError::InvalidValue { section, .. })
+                        if section == "units.state_stats.boot_grace"
+                ),
+                "{value}"
+            );
+        }
+
+        let boot_grace_config = r###"
+[monitord]
+output_format = json
+
+[units.state_stats.boot_grace]
+Blue = Database@Blue.service,240
+zero = sshd.service,0
+comma = unit\x2cname.service,10
+swap = dev-zram0.swap,5
+"###;
+        let ini_config = load_ini(boot_grace_config);
+        assert!(unknown_config_entries(ini_config.get_map_ref()).is_empty());
+        let config: Config = ini_config.try_into().expect("Failed to parse config");
+        assert_eq!(
+            config.units.boot_grace,
+            BTreeMap::from([
+                ("Database@Blue.service".into(), 240),
+                ("sshd.service".into(), 0),
+                (r"unit\x2cname.service".into(), 10),
+                ("dev-zram0.swap".into(), 5),
+            ])
+        );
     }
 
     #[test]
@@ -1236,6 +1357,7 @@ varlink = false
                 state_stats_allowlist: HashSet::from([String::from("foo.service")]),
                 state_stats_blocklist: HashSet::from([String::from("bar.service")]),
                 state_stats_time_in_state: true,
+                boot_grace: BTreeMap::from([("Database@Blue.service".into(), 240)]),
                 ignore_inactive_oneshot_services: true,
                 unit_files: true,
                 per_unit_concurrency: 16,
