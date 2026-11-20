@@ -308,23 +308,24 @@ num_slowest_units = 5
 #   binary serves only in daemon mode; library users start ReportServer.
 #   Enable this and monitord-report.socket together; see "systemd-report
 #   integration" in the README.
-# - collect: pass through metrics from other systemd-report sources:
+# - collect: pass through metrics from configured commands and other sources:
 #   every io.systemd.Metrics socket in /run/systemd/report/ except
 #   io.systemd.Manager and io.systemd.Network (already parsed by the units and
 #   networkd collectors), io.monitord (monitord itself), io.systemd.CGroup
 #   (too many keys until per-cgroup filtering lands) and systemd-report's
 #   io.systemd.Report.* signers. A source may publish thousands of metrics.
-#   Always varlink: there is no D-Bus fallback, and [varlink] enabled does
-#   not gate it.
+#   Socket sources always use varlink: no D-Bus fallback; [varlink] enabled
+#   does not gate collection. Commands run on each collection, concurrently
+#   with sockets, bounded by dbus_timeout and 16 MiB of stdout.
 [report]
 enabled = false
 collect = false
 
-# Optional: only collect these sources (if empty, all sources are collected)
+# Optional: only collect these socket sources (empty means all eligible sockets)
 [report.sources.allowlist]
 # io.systemd.Basic
 
-# Optional: never collect these sources (preferred over the allowlist)
+# Optional: never collect these socket sources (preferred over the allowlist)
 [report.sources.blocklist]
 # io.systemd.Files
 
@@ -393,7 +394,9 @@ systemd 260+ ships `systemd-report`, which gathers metrics from every
 `[report] enabled = true` in daemon mode, monitord serves its **own** health
 there as the `io.monitord` source, so `systemd-report metrics` shows whether
 monitord is collecting. These metrics are about monitord itself. The stats it
-collects are not re-exported: systemd's own sources already publish them.
+collects are not re-exported, including configured command sources. Collection
+from sockets and commands is controlled independently by `[report] collect = true`;
+see [systemd-report sources](#systemd-report-sources).
 
 | Metric | Type | Object | Value |
 |---|---|---|---|
@@ -787,8 +790,9 @@ without per-source code.
 - Sources are called concurrently, each bounded by `[monitord] dbus_timeout`.
   A source that fails reports `up = 0` and never fails the collector
 - The same rules as systemd-report apply: a metric must be named
-  `<source>.<field>`, and at most 16384 metrics per source and 128 sources are
-  read. Anything else is counted in `dropped_metrics`
+  `<source>.<field>`, and at most 16384 metrics per source and 128 socket sources
+  are read. Invalid names and records past the per-source cap are counted in
+  `dropped_metrics`
 - `[report.sources.allowlist]` / `[report.sources.blocklist]` select sources by
   socket name (case-insensitive, as the INI parser lowercases keys)
 - `[report.metrics.blocklist]` drops individual metrics from any source by full
@@ -796,6 +800,59 @@ without per-source code.
   `io.systemd.Basic.SMBIOS` drops all `io.systemd.Basic.SMBIOS.*`. Blocked
   metrics are not counted in `dropped_metrics`
 - Host only for now: sources inside machines are not collected
+
+#### Command sources
+
+With `[report] collect = true`, trusted executables can publish the same metrics:
+
+```ini
+[report.commands]
+com.example.raid = /usr/libexec/monitord/raid-health
+```
+
+A record command writes one JSON object per nonblank stdout line, for example
+`{"name":"com.example.raid.degraded","value":0,"object":"md0"}`. Each object
+requires a string `name` and a `value`; optional `object` and `fields` have the
+same shape as `io.systemd.Metrics.List`. Every line must parse, even past the
+16384-record cap. An array in place of an object fails the source. Metric names
+start with the lowercased source name followed by a dot; the normal metric
+validation, blocklist, key construction and record cap apply.
+
+Success requires exit status 0, complete valid stdout, and finishing within
+`[monitord] dbus_timeout`. Empty stdout, output over 16 MiB, timeout, execution
+failure, nonzero exit or invalid output reports `up = 0` with no metrics.
+
+Source names must be Varlink interface names.
+The INI parser folds names to lowercase but preserves executable path case. Values
+are absolute executable paths, with no arguments, shell or PATH lookup; put
+arguments in a wrapper script with a `#!` line. Paths cannot contain `;` or `#`,
+because the INI parser treats the rest of the line as a comment. Socket source
+allowlists, blocklists, reserved names and the 128-source cap apply only to
+discovered sockets. A listed socket wins over a command with the same name
+(case-insensitively), even if the socket fails. A filtered or capped socket does
+not block a command. Commands also work when the report directory is missing;
+other directory read errors fail collection before any command starts.
+
+Commands run concurrently with the socket sources on every collection. They
+inherit monitord's user, environment, working directory, ambient capabilities
+and sandbox. stdin and stderr are `/dev/null`; stdout is piped. Install only
+trusted helpers and run monitord as an unprivileged user. The supplied service's
+hardening applies to helpers too; optional machine-collection capabilities also
+reach them. Each helper leads its own process group. On timeout or excess
+output, Linux delivers `SIGKILL` to that original group through a private pipe,
+even if another part of an embedding application has already reaped the leader.
+Helpers that leave the group or change credentials can escape cleanup. If a
+leader does not exit promptly, collection reports failure and reaping continues
+in the background. The service's default `KillMode=control-group` kills helpers
+when the unit stops.
+
+Embedders should rate-limit collection calls: each call runs every command.
+Dropping a collection discards its result but leaves the command task running
+until completion or timeout so it can reap the child. Shutting down Tokio
+signals any command group still being collected. Keep the runtime alive to
+wait for the exit status. Embedders must mark inherited descriptors close-on-exec. The monitord binary claims its socket-activation descriptor
+before starting the runtime and marks it close-on-exec. A slow or independently
+scheduled check belongs in a timer-driven producer instead.
 
 #### Default metric denylist
 

@@ -1,14 +1,15 @@
 //! # report_collector module
 //!
-//! Collects every `io.systemd.Metrics` source that systemd-report (systemd
-//! v260+) would read from `/run/systemd/report/`, and passes their metrics
-//! through as generic key/value stats.
+//! Collects `io.systemd.Metrics` sources from `/run/systemd/report/` (systemd
+//! v260+) and configured commands, passing their metrics through as generic
+//! key/value stats.
 //!
 //! Each socket in that directory is named after a varlink interface (e.g.
 //! `io.systemd.Basic`), and every metric it serves must be named
 //! `<socket name>.<field>`. Sources monitord already parses into typed stats
 //! (`io.systemd.Manager`, `io.systemd.Network`) and monitord's own source
-//! (`io.monitord`) are always skipped.
+//! (`io.monitord`) are skipped during socket discovery. Configured commands
+//! supply metric records under their source name.
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -18,7 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use futures_util::stream::TryStreamExt;
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::warn;
@@ -27,10 +30,12 @@ use crate::config::ReportConfig;
 use crate::varlink::metrics::{ListOutput, Metrics, MetricsError};
 use crate::MonitordStats;
 
+mod command_group;
+
 /// Where systemd-report looks for system metrics sources.
 pub const REPORT_DIR: &str = "/run/systemd/report";
 
-/// Sources that are never collected here:
+/// Socket sources that are never collected here:
 /// - `io.systemd.Manager` and `io.systemd.Network` already feed typed
 ///   collectors (`units`, `networkd`, ...).
 /// - `io.monitord` is monitord itself.
@@ -44,7 +49,7 @@ pub const SKIP_SOURCES: &[&str] = &[
     "io.systemd.CGroup",
 ];
 
-/// Source name prefixes that are never collected: `io.systemd.Report.*`
+/// Socket source prefixes that are never collected: `io.systemd.Report.*`
 /// are systemd-report's own signers (`SignPlain`, `SignTPM2`, `SignTSM`),
 /// which only publish their public key, not health.
 pub const SKIP_SOURCE_PREFIXES: &[&str] = &["io.systemd.Report."];
@@ -52,13 +57,16 @@ pub const SKIP_SOURCE_PREFIXES: &[&str] = &["io.systemd.Report."];
 /// Same per-source cap as systemd-report (`METRICS_PER_SOURCE_MAX`).
 pub const METRICS_PER_SOURCE_MAX: usize = 16384;
 
-/// Same source cap as systemd-report (`METRICS_LINKS_MAX`).
+/// Same socket source cap as systemd-report (`METRICS_LINKS_MAX`).
 pub const SOURCES_MAX: usize = 128;
+
+/// Maximum complete stdout of one command (one extra byte detects overflow).
+const COMMAND_STDOUT_MAX: usize = 16 * 1024 * 1024;
 
 /// Metrics from one report source.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct ReportSource {
-    /// Whether the source answered `io.systemd.Metrics.List` this run
+    /// Whether collection from this source succeeded this run
     pub up: bool,
     /// Metrics the source returned but that were dropped: names not prefixed
     /// with the source name, invalid names, or past the per-source cap
@@ -74,7 +82,7 @@ pub struct ReportSource {
     pub metrics: BTreeMap<String, serde_json::Value>,
 }
 
-/// Report sources keyed by socket name (e.g. `io.systemd.Basic`)
+/// Report sources keyed by source name (e.g. `io.systemd.Basic`)
 pub type ReportStats = BTreeMap<String, ReportSource>;
 
 /// Varlink interface name check, as `varlink_idl_interface_name_is_valid()`:
@@ -248,7 +256,7 @@ pub fn flat_leaves(
     }
 }
 
-/// Turn one source's `List` replies into a [`ReportSource`], dropping what
+/// Turn one source's metric records into a [`ReportSource`], dropping what
 /// systemd-report would drop and skipping what `metric_blocklist` names.
 ///
 /// Blocked metrics are left out on purpose, so they are not counted in
@@ -377,14 +385,190 @@ async fn list_source(path: PathBuf, timeout: Duration) -> anyhow::Result<Vec<Lis
     .await?
 }
 
-/// Collect every report source in `dir`, concurrently. A failing source is
-/// reported with `up: false` and never fails the collector.
+fn parse_command_output(stdout: &[u8]) -> anyhow::Result<(Vec<ListOutput>, u64)> {
+    let text = std::str::from_utf8(stdout).context("stdout is not UTF-8")?;
+    let mut metrics = Vec::new();
+    let mut dropped = 0;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("invalid JSON on line {}", index + 1))?;
+        anyhow::ensure!(value.is_object(), "line {} is not a JSON object", index + 1);
+        anyhow::ensure!(
+            value.get("value").is_some(),
+            "line {} has no value",
+            index + 1
+        );
+        let metric: ListOutput = serde_json::from_value(value)
+            .with_context(|| format!("invalid metric on line {}", index + 1))?;
+        if metrics.len() < METRICS_PER_SOURCE_MAX {
+            metrics.push(metric);
+        } else {
+            dropped += 1;
+        }
+    }
+    anyhow::ensure!(!metrics.is_empty(), "stdout has no metrics");
+    Ok((metrics, dropped))
+}
+
+/// Run inside the source's task, which outlives cancellation of collection.
+/// Read stdout before waiting, including data written by descendants.
+async fn run_command(command: PathBuf, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    run_command_inner(
+        command,
+        timeout,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+struct CommandWaitGate {
+    waiting: tokio::sync::oneshot::Sender<libc::pid_t>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn run_command_inner(
+    command: PathBuf,
+    timeout: Duration,
+    #[cfg(test)] wait_gate: Option<CommandWaitGate>,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        command.is_absolute(),
+        "report command path must be absolute: {}",
+        command.display()
+    );
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("report command timeout exceeds the clock range")?;
+    let (mut child, group) = command_group::CommandGroup::spawn(&command)
+        .with_context(|| format!("unable to execute {}", command.display()))?;
+    #[cfg(test)]
+    let pgid = child.id().expect("a newly spawned child has an ID") as libc::pid_t;
+    let mut stdout = Vec::new();
+    let result = tokio::time::timeout_at(deadline, async {
+        child
+            .stdout
+            .take()
+            .expect("stdout is piped")
+            .take(COMMAND_STDOUT_MAX as u64 + 1)
+            .read_to_end(&mut stdout)
+            .await
+            .context("unable to read stdout")?;
+        anyhow::ensure!(stdout.len() <= COMMAND_STDOUT_MAX, "stdout exceeds 16 MiB");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    let failure = match result {
+        Ok(Ok(())) => {
+            #[cfg(test)]
+            if let Some(gate) = wait_gate {
+                let _ = gate.waiting.send(pgid);
+                let _ = gate.resume.await;
+            }
+            match tokio::time::timeout_at(deadline, child.wait()).await {
+                Ok(status) => {
+                    group.disarm();
+                    let status = status.context("unable to reap command")?;
+                    anyhow::ensure!(status.success(), "command exited with {status}");
+                    return Ok(stdout);
+                }
+                Err(_) => anyhow::anyhow!("timed out after {timeout:?}"),
+            }
+        }
+        Ok(Err(error)) => error,
+        Err(_) => anyhow::anyhow!("timed out after {timeout:?}"),
+    };
+    let signal = group.kill();
+    // Linux checks the signal recipient's credentials separately. If a helper
+    // changed identity or cannot exit promptly, finish the sample and reap it
+    // when it exits. Never fall back to signalling a numeric PID or group.
+    match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+        Ok(status) => {
+            signal.context("unable to signal failed command group")?;
+            status.context("unable to reap failed command")?;
+        }
+        Err(_) => {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            signal.context("unable to signal failed command group")?;
+            return Err(failure.context("command still running after process-group cleanup"));
+        }
+    }
+    Err(failure)
+}
+
+async fn command_source(
+    source: String,
+    command: PathBuf,
+    metric_blocklist: HashSet<String>,
+    timeout: Duration,
+) -> (String, ReportSource) {
+    let result = run_command(command, timeout)
+        .await
+        .and_then(|stdout| parse_command_output(&stdout));
+    let report_source = command_result(&source, &metric_blocklist, result);
+    (source, report_source)
+}
+
+fn command_result(
+    source: &str,
+    metric_blocklist: &HashSet<String>,
+    result: anyhow::Result<(Vec<ListOutput>, u64)>,
+) -> ReportSource {
+    match result {
+        Ok((metrics, dropped)) => {
+            let mut result = normalize_metrics(source, &metrics, metric_blocklist);
+            if dropped > 0 {
+                debug!("Dropped {dropped} records over the limit from report command {source}");
+                result.dropped_metrics += dropped;
+            }
+            result
+        }
+        Err(error) => {
+            warn!("Unable to collect report source {}: {:#}", source, error);
+            ReportSource::default()
+        }
+    }
+}
+
+/// Collect admitted sockets in `dir` and configured commands concurrently.
+/// Command keys that are invalid Varlink interface names are skipped.
+/// A failing source reports `up: false` and never fails the collector. Commands
+/// outlive cancellation of this future until they finish or time out; their late
+/// results are discarded. Shutting down the runtime signals in-flight command
+/// groups. Keep the runtime alive until completion to wait for their status.
 pub async fn collect_report_stats(
     dir: &Path,
     config: &ReportConfig,
     timeout: Duration,
 ) -> anyhow::Result<ReportStats> {
     let sources = list_sources(dir, &config.allowlist, &config.blocklist).await?;
+    let socket_names: HashSet<_> = sources.iter().map(|name| name.to_lowercase()).collect();
+    let mut commands = Vec::new();
+    for (name, command) in &config.commands {
+        if !interface_name_is_valid(name) {
+            warn!("Skipping report command {name:?}: invalid Varlink interface name");
+            continue;
+        }
+        if socket_names.contains(&name.to_lowercase()) {
+            warn!(
+                "Skipping report command {}: a listed socket has the same name",
+                name
+            );
+            continue;
+        }
+        commands.push(tokio::spawn(command_source(
+            name.clone(),
+            command.clone(),
+            config.metric_blocklist.clone(),
+            timeout,
+        )));
+    }
     let results = futures_util::future::join_all(
         sources
             .iter()
@@ -401,6 +585,10 @@ pub async fn collect_report_stats(
                 ReportSource::default()
             }
         };
+        stats.insert(source, report_source);
+    }
+    for result in futures_util::future::join_all(commands).await {
+        let (source, report_source) = result.context("report command task failed")?;
         stats.insert(source, report_source);
     }
     Ok(stats)
@@ -425,6 +613,7 @@ pub async fn update_report_stats(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
 
     fn metric(
         name: &str,
@@ -828,5 +1017,641 @@ mod tests {
         assert!(good.up);
         assert_eq!(good.metrics["Value"], serde_json::json!(1));
         assert_eq!(good.metrics["Other.x"], serde_json::json!("y"));
+    }
+
+    fn write_executable_fixture(path: &Path, contents: &str) {
+        // Write in a separate process so another test's fork cannot inherit
+        // the writable descriptor and make exec fail with ETXTBSY.
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"printf '%s' "$1" > "$2""#,
+                "write-fixture",
+                contents,
+            ])
+            .arg(path)
+            .status()
+            .expect("write executable fixture");
+        assert!(status.success(), "writing {}: {status}", path.display());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn command_fixture(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        write_executable_fixture(&path, &format!("#!/bin/sh\n{body}\n"));
+        path
+    }
+
+    fn command_config(command: PathBuf) -> ReportConfig {
+        ReportConfig {
+            commands: BTreeMap::from([("com.example.check".to_string(), command)]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_command_output_requires_complete_valid_shape() {
+        for output in [
+            b"".as_slice(),
+            b" \n",
+            b"[]",
+            br#"["com.example.check.a", 1, null, null]"#,
+            br#"{"name":"com.example.check.a"}"#,
+            b"{}",
+            br#"{"name":1,"value":0}"#,
+            br#"{"name":"com.example.check.a","value":0}
+junk"#,
+        ] {
+            assert!(parse_command_output(output).is_err(), "{output:?}");
+        }
+        let record = r#"{"name":"com.example.check.a","value":1}"#;
+        let mut output = format!("{record}\n").repeat(METRICS_PER_SOURCE_MAX + 1);
+        let (retained, dropped) = parse_command_output(output.as_bytes()).unwrap();
+        assert_eq!(retained.len(), METRICS_PER_SOURCE_MAX);
+        assert_eq!(dropped, 1);
+        output.push_str("bad line\n");
+        assert!(parse_command_output(output.as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_command_requires_absolute_path() {
+        for path in ["true", "./true"] {
+            let command = PathBuf::from(path);
+            let error = run_command(command, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("path must be absolute"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_deadline_overflow_marks_source_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            r#"printf '{"name":"com.example.check.value","value":7}'"#,
+        );
+        let stats = collect_report_stats(
+            dir.path(),
+            &command_config(command),
+            Duration::from_secs(u64::MAX),
+        )
+        .await
+        .unwrap();
+        let source = &stats["com.example.check"];
+        assert!(!source.up);
+        assert!(source.metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_command_success_and_failure_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (body, up, value)) in [
+            (
+                r#"printf '{"name":"com.example.check.value","value":2}\n'"#,
+                true,
+                Some(2),
+            ),
+            (
+                r#"printf '{"name":"com.example.check.value","value":2}\nbad'"#,
+                false,
+                None,
+            ),
+            (
+                r#"printf '{"name":"com.example.check.value","value":2}\n'; exit 1"#,
+                false,
+                None,
+            ),
+            ("exit 0", false, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let command = command_fixture(dir.path(), &format!("helper{index}"), body);
+            let stats = collect_report_stats(
+                &dir.path().join("missing"),
+                &command_config(command),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let source = &stats["com.example.check"];
+            assert_eq!(source.up, up, "case {index}");
+            assert_eq!(
+                source.metrics.get("value"),
+                value.map(serde_json::Value::from).as_ref(),
+                "case {index}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_socket_collision_and_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"touch '{}'; printf '{{"name":"com.example.check.value","value":3}}'"#,
+                marker.display()
+            ),
+        );
+        let mut config = command_config(command);
+        // Names clash case-insensitively; even a dead admitted socket wins.
+        drop(std::os::unix::net::UnixListener::bind(dir.path().join("com.example.Check")).unwrap());
+        let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(stats.len(), 1);
+        assert!(!stats["com.example.Check"].up);
+        assert!(!marker.exists());
+        config.blocklist.insert("com.example.check".into());
+        let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(stats["com.example.check"].up);
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let file = dir.path().join("not-directory");
+        std::fs::write(&file, "").unwrap();
+        assert!(collect_report_stats(&file, &config, Duration::from_secs(5))
+            .await
+            .is_err());
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn test_commands_only_run_for_valid_interface_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"printf x >> '{}'; printf '{{"name":"com.example.Check.value","value":7}}'"#,
+                calls.display()
+            ),
+        );
+        let config = ReportConfig {
+            commands: BTreeMap::from([
+                ("bad name".into(), command.clone()),
+                ("com.example.Check".into(), command),
+            ]),
+            ..Default::default()
+        };
+        let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats["com.example.Check"].metrics["value"], 7);
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn test_commands_ignore_socket_filters_and_reserved_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<_> = SKIP_SOURCES
+            .iter()
+            .map(|name| name.to_lowercase())
+            .chain(std::iter::once("io.systemd.report.signplain".to_string()))
+            .collect();
+        let config = ReportConfig {
+            commands: names
+                .iter()
+                .map(|name| {
+                    let command = command_fixture(
+                        dir.path(),
+                        name,
+                        &format!(r#"printf '{{"name":"{name}.value","value":7}}'"#),
+                    );
+                    (name.clone(), command)
+                })
+                .collect(),
+            allowlist: HashSet::from(["com.example.unrelated".to_string()]),
+            blocklist: names.iter().cloned().collect(),
+            ..Default::default()
+        };
+        let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(stats.len(), names.len());
+        for name in names {
+            assert!(stats[&name].up, "{name}");
+            assert_eq!(stats[&name].metrics["value"], 7, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_stdout_limit_includes_every_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let value = r#"{"name":"com.example.check.value","value":7}"#;
+        let command = command_fixture(dir.path(), "helper", &format!("cat '{}'", output.display()));
+        let mut bytes = vec![b' '; COMMAND_STDOUT_MAX];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        std::fs::write(&output, &bytes).unwrap();
+        let read = run_command(command.clone(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(read.len(), COMMAND_STDOUT_MAX);
+        assert_eq!(parse_command_output(&read).unwrap().0[0].value, 7);
+        bytes.push(b' ');
+        std::fs::write(&output, &bytes).unwrap();
+        assert!(run_command(command, Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("16 MiB"));
+    }
+
+    // These process tests pause Tokio's clock until the real helper signals
+    // readiness. Keep a runnable task while polling the OS so Tokio cannot
+    // auto-advance to the command deadline before the helper gets CPU. A real
+    // wall-clock deadline still bounds a broken helper or failed cleanup.
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_event<T>(
+        description: &str,
+        mut check: impl FnMut() -> Option<T>,
+    ) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(value) = check() {
+                return value;
+            }
+            assert!(std::time::Instant::now() < deadline, "{description}");
+            tokio::task::yield_now().await;
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_state(pid: u32, gone: bool) {
+        wait_for_process_event("command process did not exit/reap before deadline", || {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            let ready = if gone {
+                stat.is_err()
+            } else {
+                stat.as_ref().map_or(true, |s| {
+                    s.split(") ").nth(1).is_some_and(|s| s.starts_with('Z'))
+                })
+            };
+            ready.then_some(())
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn read_pids(path: &Path) -> Vec<u32> {
+        wait_for_process_event("helper never started", || {
+            let text = std::fs::read_to_string(path).ok()?;
+            text.ends_with('\n').then(|| {
+                text.split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect()
+            })
+        })
+        .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn finish_command(
+        task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        wait_for_process_event("command task did not finish before deadline", || {
+            task.is_finished().then_some(())
+        })
+        .await;
+        task.await.unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_command_finishing_just_before_deadline_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let release = dir.path().join("release");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"printf '%s\n' "$$" > '{}'
+while [ -d '{}' ] && [ ! -e '{}' ]; do sleep 0.01; done
+printf 7"#,
+                pids.display(),
+                dir.path().display(),
+                release.display()
+            ),
+        );
+        let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
+        let ids = read_pids(&pids).await;
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(!task.is_finished());
+        std::fs::write(release, "").unwrap();
+        let result = finish_command(task).await;
+        assert_eq!(result.unwrap(), b"7");
+        wait_for_process_state(ids[0], true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_cancelling_command_task_signals_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!("echo $$ > '{}'\nexec sleep 5", pids.display()),
+        );
+        let task = tokio::spawn(run_command(command, Duration::from_secs(15)));
+        let ids = read_pids(&pids).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_process_state(ids[0], false),
+        )
+        .await
+        .expect("cancelled helper outlived its task");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_command_wait_error_does_not_signal_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"while [ -d '{}' ]; do sleep 0.02; done >/dev/null &
+printf '%s %s\n' "$$" "$!" > '{}'
+printf 7"#,
+                dir.path().display(),
+                pids.display()
+            ),
+        );
+        let (waiting, mut at_wait) = tokio::sync::oneshot::channel();
+        let (resume, gate) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_command_inner(
+            command,
+            Duration::from_secs(1),
+            Some(CommandWaitGate {
+                waiting,
+                resume: gate,
+            }),
+        ));
+        let ids = read_pids(&pids).await;
+        let leader =
+            wait_for_process_event("command never reached wait", || at_wait.try_recv().ok()).await;
+        assert_eq!(leader, ids[0] as libc::pid_t);
+
+        // Keep a live group member so an erroneous group kill is observable.
+        wait_for_process_event("external reaper did not reap the leader", || {
+            let reaped = unsafe { libc::waitpid(leader, std::ptr::null_mut(), libc::WNOHANG) };
+            assert!(reaped >= 0, "{}", std::io::Error::last_os_error());
+            (reaped == leader).then_some(())
+        })
+        .await;
+        resume.send(()).unwrap();
+        let error = finish_command(task).await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        let source = command_result("com.example.check", &HashSet::new(), Err(error));
+        assert!(!source.up);
+        assert!(source.metrics.is_empty());
+        let descendant = std::fs::read_to_string(format!("/proc/{}/stat", ids[1])).unwrap();
+        let fields: Vec<_> = descendant
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        assert_ne!(fields[0], "Z", "{descendant}");
+        assert_eq!(fields[2].parse::<libc::pid_t>().unwrap(), leader);
+        drop(dir);
+        wait_for_process_state(ids[1], false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_command_timeout_signals_stopped_group_after_external_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                // The independent deadline also ends the stopped fixture if the test panics.
+                r#"timeout --foreground -s KILL 60 sh -c 'printf "%s %s\n" "$1" "$$" > "$2"; kill -STOP $$' sh "$$" '{}' &"#,
+                pids.display()
+            ),
+        );
+        let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
+        let ids = read_pids(&pids).await;
+        let leader = ids[0] as libc::pid_t;
+        wait_for_process_event("descendant never stopped", || {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", ids[1])).ok()?;
+            stat.rsplit_once(") ")?.1.starts_with("T ").then_some(())
+        })
+        .await;
+        wait_for_process_event("command was not reaped", || {
+            let pid = unsafe { libc::waitpid(leader, std::ptr::null_mut(), libc::WNOHANG) };
+            assert!(pid >= 0);
+            (pid == leader).then_some(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let error = finish_command(task).await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        wait_for_process_state(ids[1], false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_command_timeout_kills_group_after_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"sleep 60 &
+printf '%s %s\n' "$$" "$!" > '{}'
+exit 0"#,
+                pids.display()
+            ),
+        );
+        let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
+        let ids = read_pids(&pids).await;
+        wait_for_process_state(ids[0], false).await;
+        // Leader remains a zombie until group cleanup; its PID cannot be reused.
+        assert!(std::fs::read_to_string(format!("/proc/{}/stat", ids[0]))
+            .unwrap()
+            .contains(") Z "));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(finish_command(task)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        wait_for_process_state(ids[0], true).await;
+        wait_for_process_state(ids[1], false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_dropped_collection_still_kills_and_reaps_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"printf '%s\n' "$$" > '{}'
+exec sleep 60"#,
+                pids.display()
+            ),
+        );
+        let config = command_config(command);
+        let path = dir.path().to_owned();
+        let collection = tokio::spawn(async move {
+            collect_report_stats(&path, &config, Duration::from_secs(1)).await
+        });
+        let ids = read_pids(&pids).await;
+        collection.abort();
+        assert!(collection.await.unwrap_err().is_cancelled());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for_process_state(ids[0], true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_command_overflow_kills_and_reaps_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"sleep 60 &
+printf '%s %s\n' "$$" "$!" > '{}'
+exec yes"#,
+                pids.display()
+            ),
+        );
+        let task = tokio::spawn(run_command(command, Duration::from_secs(5)));
+        let ids = read_pids(&pids).await;
+        assert!(finish_command(task)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("16 MiB"));
+        wait_for_process_state(ids[0], true).await;
+        wait_for_process_state(ids[1], false).await;
+    }
+
+    #[tokio::test]
+    async fn test_command_and_socket_outputs_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("com.example.check");
+        let socket = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let record = r#"{"name":"com.example.check.value","value":{"healthy":true,"count":3},"object":"a.b","fields":{"mode":"fast"}}"#;
+        let reply = format!("{{\"parameters\":{record}}}\0");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = socket.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            tokio::io::AsyncWriteExt::write_all(&mut stream, reply.as_bytes())
+                .await
+                .unwrap();
+        });
+        let socket_stats =
+            collect_report_stats(dir.path(), &ReportConfig::default(), Duration::from_secs(5))
+                .await
+                .unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+        let command = command_fixture(dir.path(), "helper", &format!("printf '%s\\n' '{record}'"));
+        let command_stats =
+            collect_report_stats(dir.path(), &command_config(command), Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(command_stats, socket_stats);
+        assert!(command_stats["com.example.check"].up);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn test_command_timeout_after_stdout_closes_reaps_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let command = command_fixture(
+            dir.path(),
+            "helper",
+            &format!(
+                r#"exec >/dev/null
+printf '%s\n' "$$" > '{}'
+exec sleep 60"#,
+                pids.display()
+            ),
+        );
+        let task = tokio::spawn(run_command(command, Duration::from_secs(1)));
+        let ids = read_pids(&pids).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(finish_command(task)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        wait_for_process_state(ids[0], true).await;
+    }
+
+    #[tokio::test]
+    async fn test_commands_do_not_invoke_a_shell_for_scripts_without_shebang() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper");
+        write_executable_fixture(
+            &path,
+            r#"printf '{"name":"com.example.check.value","value":123}'"#,
+        );
+        let config = command_config(path);
+        let stats = collect_report_stats(dir.path(), &config, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!stats["com.example.check"].up);
+        assert!(stats["com.example.check"].metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_commands_treat_spaces_as_part_of_the_executable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = command_fixture(
+            dir.path(),
+            "helper --not-an-argument",
+            r#"[ "$#" -eq 0 ] || exit 1
+printf '{"name":"com.example.check.value","value":7}'"#,
+        );
+        let stats =
+            collect_report_stats(dir.path(), &command_config(command), Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert!(stats["com.example.check"].up);
+        assert_eq!(stats["com.example.check"].metrics["value"], 7);
     }
 }

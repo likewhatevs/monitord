@@ -219,7 +219,7 @@ pub struct MonitordStats {
     pub collector_timings: Vec<CollectorTiming>,
     /// Which transport served each collector on the last run.
     pub varlink_usage: VarlinkUsage,
-    /// Metrics from other systemd-report sources in `/run/systemd/report/`,
+    /// Metrics from other systemd-report sources and configured commands,
     /// keyed by source. `None` unless `[report] collect = true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<report_collector::ReportStats>,

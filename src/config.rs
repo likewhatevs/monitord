@@ -315,21 +315,22 @@ pub struct VarlinkConfig {
 /// `[report]` section: serve monitord's own health metrics to
 /// `systemd-report` over `io.systemd.Metrics` (see `crate::report`), and
 /// collect other systemd-report sources (`/run/systemd/report/*`, systemd
-/// v260+; see `crate::report_collector`).
+/// v260+) and configured commands (see `crate::report_collector`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReportConfig {
     /// Serve `io.systemd.Metrics` on `/run/systemd/report/io.monitord`
     /// (or a socket-activated fd). Off by default. The binary serves only
     /// in daemon mode; library users start `report::ReportServer` themselves.
     pub enabled: bool,
-    /// Collect every `io.systemd.Metrics` source under `/run/systemd/report/`
-    /// except those monitord already parses into typed stats. Off by default:
-    /// a single source may publish thousands of metrics.
+    /// Collect `io.systemd.Metrics` sources under `/run/systemd/report/`
+    /// and run configured commands. Sources already parsed into typed
+    /// stats are excluded from socket discovery. Off by default: a single
+    /// source may publish thousands of metrics.
     pub collect: bool,
-    /// Only collect these sources (socket names, e.g. `io.systemd.Basic`).
+    /// Only collect these socket sources (e.g. `io.systemd.Basic`).
     /// Lowercased by the INI parser, so matched case-insensitively.
     pub allowlist: HashSet<String>,
-    /// Never collect these sources
+    /// Never collect these socket sources. Matched case-insensitively.
     pub blocklist: HashSet<String>,
     /// Never collect these metrics, from any source: full metric names
     /// (e.g. `io.systemd.Basic.MachineID`), each also matching every name
@@ -338,6 +339,9 @@ pub struct ReportConfig {
     /// parser, so matched case-insensitively. The example monitord.conf
     /// lists host identifiers here; see the README for why.
     pub metric_blocklist: HashSet<String>,
+    /// Explicit command sources, keyed by lowercased interface name. Socket
+    /// source filters do not apply to these opt-in sources.
+    pub commands: BTreeMap<String, PathBuf>,
 }
 
 /// Config struct
@@ -668,6 +672,24 @@ impl TryFrom<Ini> for Config {
             config.report.metric_blocklist =
                 metric_blocklist.keys().map(|s| s.to_string()).collect();
         }
+        if let Some(commands) = config_map.get("report.commands") {
+            for (name, value) in commands {
+                let invalid = |reason: &str| MonitordConfigError::InvalidValue {
+                    section: "report.commands".to_string(),
+                    key: name.clone(),
+                    reason: reason.to_string(),
+                };
+                if !crate::report_collector::interface_name_is_valid(name) {
+                    return Err(invalid("expected a Varlink interface name"));
+                }
+                let path = value
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or_else(|| invalid("expected an absolute executable path"))?;
+                config.report.commands.insert(name.clone(), path);
+            }
+        }
 
         for entry in unknown_config_entries(&config_map) {
             warn!("Ignoring {entry}; check for a typo'd key or section");
@@ -764,6 +786,7 @@ const DATA_SECTIONS: &[&str] = &[
     "report.sources.allowlist",
     "report.sources.blocklist",
     "report.metrics.blocklist",
+    "report.commands",
 ];
 
 /// Unrecognized sections and keys, for warn-on-typo diagnostics.
@@ -1416,6 +1439,7 @@ varlink = false
                     String::from("io.systemd.basic.machineid"),
                     String::from("io.systemd.basic.smbios"),
                 ]),
+                commands: BTreeMap::new(),
             },
         };
 
@@ -1449,5 +1473,48 @@ varlink = false
 
         let result: Result<Config, _> = ini_config.try_into();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_report_commands_validate_names_and_paths() {
+        for text in [
+            r###"
+[report.commands]
+com.example.check = relative/path
+"###,
+            r###"
+[report.commands]
+com.example.check
+"###,
+            r###"
+[report.commands]
+bad = /bin/true
+"###,
+        ] {
+            let invalid_config = format!(
+                r###"
+[monitord]
+output_format = json
+{text}
+"###
+            );
+            let ini_config = load_ini(&invalid_config);
+            assert!(Config::try_from(ini_config).is_err(), "{text}");
+        }
+
+        let commands_config = r###"
+[monitord]
+output_format = json
+
+[report.commands]
+COM.EXAMPLE.Check = /usr/libexec/Record With Spaces
+"###;
+        let ini_config = load_ini(commands_config);
+        assert!(unknown_config_entries(ini_config.get_map_ref()).is_empty());
+        let config: Config = ini_config.try_into().expect("Failed to parse config");
+        assert_eq!(
+            config.report.commands["com.example.check"],
+            PathBuf::from("/usr/libexec/Record With Spaces")
+        );
     }
 }

@@ -28,7 +28,7 @@ struct-field-names-as-array = "0.3"
 strum = "0.28"
 strum_macros = "0.28"
 thiserror = "2.0"
-tokio = { version = "1.53", features = ["fs", "rt", "rt-multi-thread", "macros", "tracing", "time", "sync", "signal"] }
+tokio = { version = "1.53", features = ["fs", "rt", "rt-multi-thread", "macros", "tracing", "time", "sync", "signal", "process"] }
 tracing = "0.1"
 tracing-core = "0.1"
 tracing-glog = "0.4"

@@ -1233,6 +1233,55 @@ def shipped_unit_properties(repo: Path) -> list[str]:
 CAPS_USER = "monitord-ci"
 CAPS_CONF = "/run/monitord-caps-ci.conf"
 REPORT_USER = "monitord-report-ci"
+COMMAND_IDENTITY_SOURCE = "com.example.identity"
+COMMAND_IDENTITY_HELPER = "/run/monitord-command-identity.sh"
+COMMAND_IDENTITY_HELPER_TEXT = """#!/bin/sh
+while read -r key value; do
+    case "$key" in
+        Uid:)
+            set -- $value
+            printf '{"name":"com.example.identity.uid","value":%s}\\n' "$2"
+            ;;
+        CapPrm:|CapEff:|CapAmb:)
+            printf '{"name":"com.example.identity.%s","value":"%s"}\\n' "${key%:}" "$value"
+            ;;
+        NoNewPrivs:)
+            printf '{"name":"com.example.identity.NoNewPrivs","value":%s}\\n' "$value"
+            ;;
+    esac
+done < /proc/self/status
+"""
+
+
+def build_capability_report_conf(varlink_conf: str) -> str:
+    """Collect the identity command alongside the capability matrix's collectors."""
+    conf = replace_once(varlink_conf, "collect = false", "collect = true")
+    # Restrict discovery to a nonexistent socket; source filters must not keep
+    # the explicitly configured command from running.
+    conf = replace_once(
+        conf, "[report.sources.allowlist]", "[report.sources.allowlist]\ncom.example.none"
+    )
+    return conf + (
+        "\n[report.commands]\n"
+        f"{COMMAND_IDENTITY_SOURCE} = {COMMAND_IDENTITY_HELPER}\n"
+    )
+
+
+def check_report_command_identity(stats: Stats, uid: int, caps: int) -> None:
+    """A plain helper inherits the unit's user, ambient caps and hardening."""
+    prefix = f"monitord.report.{COMMAND_IDENTITY_SOURCE}"
+    expected = {
+        f"{prefix}.up": 1,
+        f"{prefix}.metrics.uid": uid,
+        f"{prefix}.metrics.CapPrm": f"{caps:016x}",
+        f"{prefix}.metrics.CapEff": f"{caps:016x}",
+        f"{prefix}.metrics.CapAmb": f"{caps:016x}",
+        f"{prefix}.metrics.NoNewPrivs": 1,
+    }
+    for key, value in expected.items():
+        if stats.get(key) != value:
+            raise SystemExit(f"FAIL: command identity {key}={stats.get(key)!r}, expected {value!r}")
+    print(f"PASS: command inherits uid={uid}, capabilities={caps:#x} and NoNewPrivileges")
 
 
 def run_monitord_as_user(
@@ -1271,9 +1320,18 @@ def assert_capability_matrix(container: str, repo: Path) -> None:
         capture_output=True,
     )
     # /tmp is private under the shipped unit (PrivateTmp=yes).
-    docker_exec(container, "cp", VARLINK_CONF, CAPS_CONF)
+    write_container_file(
+        container, CAPS_CONF,
+        build_capability_report_conf(docker_exec(container, "cat", VARLINK_CONF)),
+    )
+    write_container_file(container, COMMAND_IDENTITY_HELPER, COMMAND_IDENTITY_HELPER_TEXT)
+    docker_exec(container, "chmod", "755", COMMAND_IDENTITY_HELPER)
+    uid = int(docker_exec(container, "id", "-u", CAPS_USER).strip())
+    if uid == 0:
+        raise SystemExit("FAIL: capability fixture user must be unprivileged")
 
     stats, log = run_monitord_as_user(container, repo, "")
+    check_report_command_identity(stats, uid, 0)
     collected = [m for m in MACHINE_NAMES if machine_varlink_usage(stats, m)]
     if collected:
         raise SystemExit(f"FAIL: no-caps run unexpectedly collected machines: {collected}")
@@ -1282,6 +1340,7 @@ def assert_capability_matrix(container: str, repo: Path) -> None:
     print("PASS: no capabilities: machines are unreachable, host collection unaffected")
 
     stats, log = run_monitord_as_user(container, repo, "CAP_SYS_PTRACE")
+    check_report_command_identity(stats, uid, 1 << 19)
     check_machine_varlink_usage(
         "CAP_SYS_PTRACE",
         stats,
@@ -1297,6 +1356,7 @@ def assert_capability_matrix(container: str, repo: Path) -> None:
     print("PASS: CAP_SYS_PTRACE: machines over D-Bus after a single warning")
 
     stats, log = run_monitord_as_user(container, repo, "CAP_SYS_PTRACE CAP_SYS_ADMIN")
+    check_report_command_identity(stats, uid, (1 << 19) | (1 << 21))
     check_machine_varlink_usage(
         "CAP_SYS_PTRACE+CAP_SYS_ADMIN", stats, EXPECTED_MACHINE_VARLINK_USAGE["varlink"]
     )
@@ -1490,6 +1550,9 @@ REPORT_SOCKET = "/run/systemd/report/io.monitord"
 # /run, not /tmp: the shipped unit has PrivateTmp=yes.
 REPORT_CONF = "/run/monitord-report-ci.conf"
 REPORT_UNIT_DIR = "/run/systemd/system"
+REPORT_COMMAND_HELPER = "/run/monitord-command-fds.sh"
+REPORT_COMMAND_OUTPUT = "/run/monitord-command-output.json"
+REPORT_COMMAND_SOURCE = "com.example.inherited-sockets"
 # Families present once a collection run has finished.
 REPORT_FAMILIES = {
     "io.monitord.collectionErrorsTotal",
@@ -1531,6 +1594,60 @@ def build_report_conf(varlink_conf: str) -> str:
         "[report]\nenabled = false",
         "[report]\nenabled = true",
     )
+
+
+def build_command_report_conf(report_conf: str) -> str:
+    """Enable collection and a record command while serving the activated fd."""
+    conf = replace_once(report_conf, "collect = false", "collect = true")
+    return conf + (
+        "\n[report.commands]\n"
+        f"{REPORT_COMMAND_SOURCE} = {REPORT_COMMAND_HELPER}\n"
+    )
+
+
+def check_report_command_output(text: str) -> bool:
+    """Find a successful command sample in the daemon's combined output.
+
+    systemd's default StandardError=inherit puts tracing into the same file
+    as StandardOutput. Only a JSON object at the start of a line is a sample;
+    braces inside a tracing message are not sample data. The daemon may still
+    be writing the final sample, so leave incomplete JSON for the next poll.
+    """
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while cursor < len(text):
+        end_of_line = text.find("\n", cursor)
+        if end_of_line == -1:
+            end_of_line = len(text)
+        line = text[cursor:end_of_line]
+        stripped = line.lstrip()
+        if not stripped.startswith("{"):
+            cursor = end_of_line + 1
+            continue
+        start = cursor + len(line) - len(stripped)
+        try:
+            sample, cursor = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            return False
+        prefix = f"monitord.report.{REPORT_COMMAND_SOURCE}"
+        if sample.get(f"{prefix}.up") == 1:
+            count = sample.get(f"{prefix}.metrics.value")
+            if count != 0:
+                raise SystemExit(f"FAIL: command inherited {count!r} sockets")
+            return True
+    return False
+
+
+def assert_report_command_fds(container: str) -> None:
+    """Inspect collected stats, since io.monitord only serves collector health."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        text = docker_exec(container, "cat", REPORT_COMMAND_OUTPUT)
+        if check_report_command_output(text):
+            print("PASS: activated monitord command inherited no sockets (up=1)")
+            return
+        time.sleep(0.2)
+    raise SystemExit("FAIL: no successful command sample under socket activation")
 
 
 def build_report_service(service_text: str, binary: str, conf: str, user: str) -> str:
@@ -1595,8 +1712,23 @@ def assert_report_socket(container: str, repo: Path) -> None:
     write_container_file(
         container,
         REPORT_CONF,
-        build_report_conf(docker_exec(container, "cat", VARLINK_CONF)),
+        build_command_report_conf(
+            build_report_conf(docker_exec(container, "cat", VARLINK_CONF))
+        ),
     )
+    write_container_file(
+        container,
+        REPORT_COMMAND_HELPER,
+        "#!/bin/sh\n"
+        "count=0\n"
+        "for fd in /proc/$$/fd/*; do\n"
+        "    if [ -S \"$fd\" ]; then count=$((count + 1)); fi\n"
+        "done\n"
+        f"printf '{{\"name\":\"{REPORT_COMMAND_SOURCE}.value\",\"value\":%s}}\\n' \"$count\"\n",
+    )
+    docker_exec(container, "chmod", "755", REPORT_COMMAND_HELPER)
+    # A reused container may still have output from a previous run.
+    docker_exec(container, "rm", "-f", REPORT_COMMAND_OUTPUT)
     write_container_file(
         container,
         f"{REPORT_UNIT_DIR}/monitord.service",
@@ -1605,7 +1737,7 @@ def assert_report_socket(container: str, repo: Path) -> None:
             f"{CONTAINER_TARGET_DIR}/release/monitord",
             REPORT_CONF,
             REPORT_USER,
-        ),
+        ).replace("[Service]", f"[Service]\nStandardOutput=file:{REPORT_COMMAND_OUTPUT}"),
     )
     write_container_file(
         container,
@@ -1641,6 +1773,7 @@ def assert_report_socket(container: str, repo: Path) -> None:
                 f"FAIL: io.monitord metrics never became healthy: {problems}\n{journal}"
             )
         print(f"PASS: io.monitord List healthy after {poll} polls ({len(listed)} metrics)")
+        assert_report_command_fds(container)
 
         described = parse_json_seq(
             docker_exec(
