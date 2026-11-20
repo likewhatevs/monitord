@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{self, FuturesUnordered};
 use futures_util::StreamExt;
+use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+use rustix::net::sockopt::{socket_acceptconn, socket_domain, socket_type};
 use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
@@ -368,46 +370,35 @@ pub unsafe fn take_activation_fd() -> anyhow::Result<Option<OwnedFd>> {
         count == 1,
         "expected exactly one activation fd, got {count}"
     );
-    validate_listener(SD_LISTEN_FDS_START)?;
-    set_cloexec(SD_LISTEN_FDS_START)?;
+    // Activation metadata can name a closed fd. Check before borrowing it.
+    if unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd 3 is open and the caller guarantees exclusive access.
+    let fd = unsafe { BorrowedFd::borrow_raw(SD_LISTEN_FDS_START) };
+    validate_listener(fd)?;
+    set_cloexec(fd)?;
     // SAFETY: validation proved fd 3 is open; the caller guarantees sole ownership.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) }))
 }
 
-fn set_cloexec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+fn set_cloexec(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    Ok(fcntl_setfd(fd, fcntl_getfd(fd)? | FdFlags::CLOEXEC)?)
 }
 
-fn validate_listener(fd: std::os::fd::RawFd) -> anyhow::Result<()> {
-    for (option, expected, description) in [
-        (libc::SO_DOMAIN, libc::AF_UNIX, "Unix domain"),
-        (libc::SO_TYPE, libc::SOCK_STREAM, "stream"),
-        (libc::SO_ACCEPTCONN, 1, "listening"),
-    ] {
-        let mut value: libc::c_int = 0;
-        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-        // SAFETY: value and len point to writable storage of the expected size.
-        if unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                (&mut value as *mut libc::c_int).cast(),
-                &mut len,
-            )
-        } < 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        anyhow::ensure!(
-            value == expected,
-            "report fd must be a listening Unix stream socket (not {description})"
-        );
-    }
+fn validate_listener(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        socket_domain(fd).map_err(std::io::Error::from)? == AddressFamily::UNIX,
+        "report fd must be a listening Unix stream socket (not Unix domain)"
+    );
+    anyhow::ensure!(
+        socket_type(fd).map_err(std::io::Error::from)? == SocketType::STREAM,
+        "report fd must be a listening Unix stream socket (not stream)"
+    );
+    anyhow::ensure!(
+        socket_acceptconn(fd).map_err(std::io::Error::from)?,
+        "report fd must be a listening Unix stream socket (not listening)"
+    );
     Ok(())
 }
 
@@ -526,14 +517,14 @@ impl Drop for SocketCleanup {
 fn listener(
     spec: ReportListener,
     cleanup: &mut Option<SocketCleanup>,
-    #[cfg(test)] set_cloexec_override: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
+    #[cfg(test)] set_cloexec_override: Option<fn(BorrowedFd<'_>) -> std::io::Result<()>>,
 ) -> anyhow::Result<UnixListener> {
     #[cfg(test)]
     let set_cloexec = set_cloexec_override.unwrap_or(set_cloexec);
     match spec {
         ReportListener::Prebound(fd) => {
-            validate_listener(fd.as_raw_fd())?;
-            set_cloexec(fd.as_raw_fd())?;
+            validate_listener(fd.as_fd())?;
+            set_cloexec(fd.as_fd())?;
             info!("Serving {REPORT_SOCKET_NAME} metrics on a prebound fd");
             let listener = std::os::unix::net::UnixListener::from(fd);
             listener.set_nonblocking(true).map_err(zlink::Error::Io)?;
@@ -731,7 +722,7 @@ async fn serve(
 #[cfg(test)]
 #[derive(Default)]
 struct ServerHooks {
-    set_cloexec: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
+    set_cloexec: Option<fn(BorrowedFd<'_>) -> std::io::Result<()>>,
     bound: Option<tokio::sync::oneshot::Sender<()>>,
     before_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     ready_sent: Option<tokio::sync::oneshot::Sender<()>>,
@@ -949,6 +940,7 @@ mod tests {
     use crate::varlink::metrics::{Metrics, MetricsError};
     use futures_util::StreamExt;
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use zlink::tokio::unix::Connection;
 
     pub(super) async fn inject_accept_error<T>(

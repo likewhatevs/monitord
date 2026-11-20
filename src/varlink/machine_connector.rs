@@ -199,6 +199,7 @@ mod sys {
         self, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
         SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
     };
+    use rustix::{process, thread};
 
     use super::{MachineConnector, MachineConnectorError, MachineSocket, HELPER_ARG};
 
@@ -231,10 +232,10 @@ mod sys {
         let child = std::thread::scope(|scope| {
             scope
                 .spawn(|| -> io::Result<std::process::Child> {
-                    // SAFETY: plain syscall on a valid fd we own.
-                    if unsafe { libc::setns(pidns.as_raw_fd(), libc::CLONE_NEWPID) } != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
+                    thread::move_into_link_name_space(
+                        pidns.as_fd(),
+                        Some(thread::LinkNameSpaceType::ProcessID),
+                    )?;
                     Command::new("/proc/self/exe")
                         .arg(HELPER_ARG)
                         .arg(leader_pid.to_string())
@@ -333,57 +334,29 @@ mod sys {
     /// Become unprivileged for good: no root identity, no capabilities, and
     /// no way to regain any.
     fn drop_privileges() -> io::Result<()> {
-        // SAFETY: plain syscalls with valid arguments.
-        unsafe {
-            if libc::getuid() == 0 || libc::geteuid() == 0 {
+        if process::getuid().is_root() || process::geteuid().is_root() {
+            // Use libc's process-wide credential changes. The rustix setters
+            // change the calling thread's credentials only.
+            // SAFETY: zero groups uses no buffer, and all IDs are valid.
+            unsafe {
                 check(libc::setgroups(0, std::ptr::null()))?;
                 check(libc::setresgid(NOBODY, NOBODY, NOBODY))?;
                 check(libc::setresuid(NOBODY, NOBODY, NOBODY))?;
             }
-            check(libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_CLEAR_ALL,
-                0,
-                0,
-                0,
-            ))?;
-            #[repr(C)]
-            struct CapHeader {
-                version: u32,
-                pid: libc::c_int,
-            }
-            #[repr(C)]
-            struct CapData {
-                effective: u32,
-                permitted: u32,
-                inheritable: u32,
-            }
-            const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-            let header = CapHeader {
-                version: LINUX_CAPABILITY_VERSION_3,
-                pid: 0,
-            };
-            let data = [
-                CapData {
-                    effective: 0,
-                    permitted: 0,
-                    inheritable: 0,
-                },
-                CapData {
-                    effective: 0,
-                    permitted: 0,
-                    inheritable: 0,
-                },
-            ];
-            if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
-            // The helper lives inside the machine's PID namespace, where
-            // processes running under the same numeric UID could otherwise
-            // ptrace it (dropping from root already clears this flag).
-            check(libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0))?;
         }
+        thread::clear_ambient_capability_set()?;
+        thread::set_capabilities(
+            None,
+            thread::CapabilitySets {
+                effective: thread::CapabilitySet::empty(),
+                permitted: thread::CapabilitySet::empty(),
+                inheritable: thread::CapabilitySet::empty(),
+            },
+        )?;
+        thread::set_no_new_privs(true)?;
+        // Processes in the machine with the same numeric UID could otherwise
+        // ptrace the helper (dropping from root already clears this flag).
+        process::set_dumpable_behavior(process::DumpableBehavior::NotDumpable)?;
         Ok(())
     }
 
