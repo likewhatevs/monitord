@@ -198,7 +198,7 @@ pub async fn get_verify_stats(
     blocklist: &HashSet<String>,
 ) -> Result<VerifyStats, MonitordVerifyError> {
     // Get list of all units from systemd
-    let manager_proxy = crate::dbus::zbus_systemd::ManagerProxy::builder(connection)
+    let manager_proxy = zbus_systemd::systemd1::ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;

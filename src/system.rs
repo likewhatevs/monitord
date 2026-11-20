@@ -195,7 +195,7 @@ pub fn parse_system_state(system_state: &str) -> SystemdSystemState {
 pub async fn get_system_state(
     connection: &zbus::Connection,
 ) -> Result<SystemdSystemState, MonitordSystemError> {
-    let p = crate::dbus::zbus_systemd::ManagerProxy::builder(connection)
+    let p = zbus_systemd::systemd1::ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
@@ -236,7 +236,7 @@ pub async fn update_system_stats(
 pub async fn get_version(
     connection: &zbus::Connection,
 ) -> Result<SystemdVersion, MonitordSystemError> {
-    let p = crate::dbus::zbus_systemd::ManagerProxy::builder(connection)
+    let p = zbus_systemd::systemd1::ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await

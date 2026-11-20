@@ -273,7 +273,7 @@ pub struct InterfaceState {
 async fn get_interface_links(
     connection: &zbus::Connection,
 ) -> Result<HashMap<i32, String>, MonitordNetworkdError> {
-    let p = crate::dbus::zbus_networkd::ManagerProxy::builder(connection)
+    let p = zbus_systemd::network1::ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;

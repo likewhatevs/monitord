@@ -23,7 +23,7 @@ cargo run -- -c monitord.conf -l debug  # Run locally with debug logging
 **Non-Linux development:** Use the Docker container (`docker build .` — Fedora Rawhide with systemd). Tests and runtime require systemd.
 
 **Integration test (varlink, D-Bus, machines):** anything touching varlink, D-Bus
-collection, or machines (including dependency bumps like zbus/zlink) must be
+collection, or machines (including bumps to zbus, zbus_systemd, or zlink) must be
 verified end to end with:
 
 ```bash
@@ -37,8 +37,6 @@ in the Docker image, boots nspawn fixture machines (`testbox`,
 machine collection per capability set (including the `MachineConnector`
 PID-namespace helper), so no root or host containers are needed. Run it
 yourself rather than leaving machine collection "untested".
-
-**D-Bus proxy regeneration:** `zbus-xmlgen system org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/...` — output goes in `src/dbus/`.
 
 **Releasing a new version:**
 
@@ -56,7 +54,7 @@ Single-crate project (both library and binary). The binary (`main.rs`) parses CL
 
 1. `main.rs` → CLI parsing (clap) + config loading (configparser INI)
 2. `lib.rs::stat_collector()` → spawns collectors in parallel via `tokio::task::JoinSet`
-3. Each collector communicates with systemd over D-Bus using async zbus proxies
+3. Collectors query systemd, machined, and networkd over D-Bus using async proxies from `zbus_systemd`
 4. Results merged into `MonitordStats` behind `Arc<RwLock<>>`
 5. Output formatted as JSON (compact, pretty, or flat dot-notation) via `json.rs`
 
@@ -70,7 +68,6 @@ Single-crate project (both library and binary). The binary (`main.rs`) parses CL
 - `timer.rs` — Timer unit statistics
 - `machines.rs` — Container stats; recursively opens D-Bus connections to each container and collects the same stat types
 - `dbus_stats.rs` — D-Bus daemon statistics (supports both dbus-broker and dbus-daemon)
-- `dbus/` — Auto-generated zbus proxy interfaces (via `zbus-xmlgen`); do not hand-edit
 
 ### Run Modes
 

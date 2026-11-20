@@ -7,6 +7,7 @@ use futures_util::stream::TryStreamExt;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, warn};
+use zbus_systemd::machine1::{MachineProxy, ManagerProxy};
 
 use crate::varlink::endpoint::VarlinkEndpoint;
 use crate::varlink::machine::{ListOutput, Machine, MACHINE_SOCKET_PATH};
@@ -65,14 +66,17 @@ fn keep_machine(
         && (allowlist.is_empty() || allowlist.contains(name))
 }
 
+/// A machined `ListMachines` row: name, class, service and object path.
+pub type ListedMachine = (String, String, String, zbus::OwnedObjectPath);
+
 pub fn filter_machines(
-    machines: Vec<crate::dbus::zbus_machines::ListedMachine>,
+    machines: Vec<ListedMachine>,
     allowlist: &HashSet<String>,
     blocklist: &HashSet<String>,
-) -> Vec<crate::dbus::zbus_machines::ListedMachine> {
+) -> Vec<ListedMachine> {
     machines
         .into_iter()
-        .filter(|c| keep_machine(&c.name, &c.class, allowlist, blocklist))
+        .filter(|(name, class, _, _)| keep_machine(name, class, allowlist, blocklist))
         .collect()
 }
 
@@ -167,7 +171,7 @@ async fn get_machines_dbus(
     connection: &zbus::Connection,
     config: &crate::config::Config,
 ) -> Result<HashMap<String, u32>, MonitordMachinesError> {
-    let c = crate::dbus::zbus_machines::ManagerProxy::builder(connection)
+    let c = ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;
@@ -175,14 +179,15 @@ async fn get_machines_dbus(
 
     let machines = c.list_machines().await?;
 
-    for machine in filter_machines(
+    for (name, _, _, _) in filter_machines(
         machines,
         &config.machines.allowlist,
         &config.machines.blocklist,
     ) {
-        let m = c.get_machine(&machine.name).await?;
+        let path = c.get_machine(name.clone()).await?;
+        let m = MachineProxy::builder(connection).path(path).build().await?;
         let leader_pid = m.leader().await?;
-        results.insert(machine.name, leader_pid);
+        results.insert(name, leader_pid);
     }
 
     Ok(results)
@@ -682,34 +687,25 @@ mod tests {
 
     #[test]
     fn test_filter_machines() {
-        let machines = vec![
-            crate::dbus::zbus_machines::ListedMachine {
-                name: "foo".to_string(),
-                class: "container".to_string(),
-                service: "".to_string(),
-                path: OwnedObjectPath::try_from("/sample/object").unwrap(),
-            },
-            crate::dbus::zbus_machines::ListedMachine {
-                name: "bar".to_string(),
-                class: "container".to_string(),
-                service: "".to_string(),
-                path: OwnedObjectPath::try_from("/sample/object").unwrap(),
-            },
-            crate::dbus::zbus_machines::ListedMachine {
-                name: "baz".to_string(),
-                class: "container".to_string(),
-                service: "".to_string(),
-                path: OwnedObjectPath::try_from("/sample/object").unwrap(),
-            },
-        ];
+        let machines = ["foo", "bar", "baz"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    "container".to_string(),
+                    String::new(),
+                    OwnedObjectPath::try_from("/sample/object").unwrap(),
+                )
+            })
+            .collect();
         let allowlist = HashSet::from(["foo".to_string(), "baz".to_string()]);
         let blocklist = HashSet::from(["bar".to_string()]);
 
         let filtered = super::filter_machines(machines, &allowlist, &blocklist);
 
         assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].name, "foo");
-        assert_eq!(filtered[1].name, "baz");
+        assert_eq!(filtered[0].0, "foo");
+        assert_eq!(filtered[1].0, "baz");
     }
 
     #[test]

@@ -416,12 +416,12 @@ async fn parse_service(
 ) -> Result<ServiceStats, MonitordUnitsError> {
     debug!("Parsing service {} stats", name);
 
-    let sp = crate::dbus::zbus_service::ServiceProxy::builder(connection)
+    let sp = zbus_systemd::systemd1::ServiceProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .path(object_path.clone())
         .build()
         .await?;
-    let up = crate::dbus::zbus_unit::UnitProxy::builder(connection)
+    let up = zbus_systemd::systemd1::UnitProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .path(object_path.clone())
         .build()
@@ -464,12 +464,12 @@ async fn parse_service(
         up.active_enter_timestamp(),
         up.active_exit_timestamp(),
         up.inactive_exit_timestamp(),
-        sp.nrestarts(),
-        sp.restart_usec(),
+        sp.n_restarts(),
+        sp.restart_u_sec(),
         up.state_change_timestamp(),
         sp.status_errno(),
-        sp.timeout_clean_usec(),
-        sp.watchdog_usec(),
+        sp.timeout_clean_u_sec(),
+        sp.watchdog_u_sec(),
         cgroup_stats,
     );
 
@@ -490,19 +490,19 @@ async fn parse_service(
         async {
             match cgroup_stats.cpu_usage_nsec {
                 Some(value) => Ok(value),
-                None => sp.cpuusage_nsec().await,
+                None => sp.cpu_usage_n_sec().await,
             }
         },
         async {
             match cgroup_stats.io_read_bytes {
                 Some(value) => Ok(value),
-                None => sp.ioread_bytes().await,
+                None => sp.io_read_bytes().await,
             }
         },
         async {
             match cgroup_stats.io_read_operations {
                 Some(value) => Ok(value),
-                None => sp.ioread_operations().await,
+                None => sp.io_read_operations().await,
             }
         },
         async {
@@ -580,7 +580,7 @@ async fn get_time_in_state(
 ) -> Result<Option<u64>, MonitordUnitsError> {
     match connection {
         Some(c) => {
-            let up = crate::dbus::zbus_unit::UnitProxy::builder(c)
+            let up = zbus_systemd::systemd1::UnitProxy::builder(c)
                 .cache_properties(zbus::proxy::CacheProperties::No)
                 .path(ObjectPath::from(unit.unit_object_path.clone()))
                 .build()
@@ -685,12 +685,12 @@ async fn is_oneshot_service_at_path(
     connection: &zbus::Connection,
     object_path: &OwnedObjectPath,
 ) -> Result<bool, MonitordUnitsError> {
-    let sp = crate::dbus::zbus_service::ServiceProxy::builder(connection)
+    let sp = zbus_systemd::systemd1::ServiceProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .path(ObjectPath::from(object_path.clone()))
         .build()
         .await?;
-    Ok(sp.type_().await? == "oneshot")
+    Ok(sp.type_property().await? == "oneshot")
 }
 
 /// Parse a unit and add to overall counts of state, type etc.
@@ -887,7 +887,7 @@ pub async fn parse_unit_state(
 
     let mut stats = SystemdUnitStats::default();
 
-    let p = crate::dbus::zbus_systemd::ManagerProxy::builder(connection)
+    let p = zbus_systemd::systemd1::ManagerProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await?;
