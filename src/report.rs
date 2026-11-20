@@ -112,8 +112,7 @@ pub const FAMILIES: &[(&str, &str, MetricFamilyType)] = &[
     ("version", "monitord version", MetricFamilyType::String),
 ];
 
-/// Counters kept across collection runs. Not part of `MonitordStats` so the
-/// JSON output is unchanged; only the report server reads them.
+/// Counters kept across collection runs, skipped in stats JSON output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReportState {
     pub collection_runs_total: u64,

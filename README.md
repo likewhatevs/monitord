@@ -406,7 +406,9 @@ would delete its own report directory, with the other sources' sockets in it,
 whenever monitord stops.
 
 Library users with their own collection loop (e.g. monitord-exporter) can
-serve the same metrics with `monitord::report::spawn_server`.
+serve the same metrics with `monitord::report::spawn_server`. Sequential
+one-shot calls to `stat_collector` with the same shared `MonitordStats`
+retain collection counters across samples.
 
 ## Machines support
 

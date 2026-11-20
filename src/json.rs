@@ -892,6 +892,7 @@ mod tests {
 
     fn return_monitord_stats() -> MonitordStats {
         let mut stats = MonitordStats {
+            report_state: Default::default(),
             networkd: networkd::NetworkdState {
                 interfaces_state: vec![networkd::InterfaceState {
                     address_state: networkd::AddressState::routable,
