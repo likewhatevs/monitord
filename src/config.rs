@@ -6,6 +6,7 @@ use std::str::FromStr;
 use configparser::ini::Ini;
 use indexmap::map::IndexMap;
 use int_enum::IntEnum;
+use smart_default::SmartDefault;
 use strum_macros::EnumString;
 use thiserror::Error;
 use tracing::{error, warn};
@@ -42,97 +43,65 @@ pub enum MonitordOutputFormat {
     JsonPretty = 2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct MonitordConfig {
+    #[default(crate::DEFAULT_DBUS_ADDRESS.into())]
     pub dbus_address: String,
     pub daemon: bool,
+    #[default = 30]
     pub daemon_stats_refresh_secs: u64,
     pub key_prefix: String,
     pub output_format: MonitordOutputFormat,
+    #[default = 30]
     pub dbus_timeout: u64,
 }
-impl Default for MonitordConfig {
-    fn default() -> Self {
-        MonitordConfig {
-            dbus_address: crate::DEFAULT_DBUS_ADDRESS.into(),
-            daemon: false,
-            daemon_stats_refresh_secs: 30,
-            key_prefix: "".to_string(),
-            output_format: MonitordOutputFormat::default(),
-            dbus_timeout: 30,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct NetworkdConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus/files while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
+    #[default(crate::networkd::NETWORKD_STATE_FILES.into())]
     pub link_state_dir: PathBuf,
 }
-impl Default for NetworkdConfig {
-    fn default() -> Self {
-        NetworkdConfig {
-            enabled: false,
-            varlink: true,
-            link_state_dir: crate::networkd::NETWORKD_STATE_FILES.into(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct Pid1Config {
+    #[default = true]
     pub enabled: bool,
 }
-impl Default for Pid1Config {
-    fn default() -> Self {
-        Pid1Config { enabled: true }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct SystemStateConfig {
+    #[default = true]
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink. Also gates the always-on
     /// systemd version collection, which shares the `Manager.Describe` call.
+    #[default = true]
     pub varlink: bool,
 }
-impl Default for SystemStateConfig {
-    fn default() -> Self {
-        SystemStateConfig {
-            enabled: true,
-            varlink: true,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct TimersConfig {
+    #[default = true]
     pub enabled: bool,
     pub allowlist: HashSet<String>,
     pub blocklist: HashSet<String>,
 }
-impl Default for TimersConfig {
-    fn default() -> Self {
-        TimersConfig {
-            enabled: true,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct UnitsConfig {
+    #[default = true]
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
     /// Unit-name patterns for failed counts, keyed by family. Each pattern
     /// matches a full name or contains one `*` matching a non-empty string.
@@ -140,48 +109,36 @@ pub struct UnitsConfig {
     pub state_stats: bool,
     pub state_stats_allowlist: HashSet<String>,
     pub state_stats_blocklist: HashSet<String>,
+    #[default = true]
     pub state_stats_time_in_state: bool,
     /// Host unit names mapped to their health grace period from boot, in seconds.
     pub boot_grace: BTreeMap<String, u64>,
+    #[default = true]
     pub ignore_inactive_oneshot_services: bool,
+    #[default = true]
     pub unit_files: bool,
     /// Max number of units whose D-Bus work runs concurrently in the per-unit
     /// collection loop. Bounded (rather than unbounded) so a burst of
     /// simultaneous D-Bus calls doesn't itself worsen host-level IPC
     /// contention on hosts where per-call latency is already elevated.
+    #[default = 8]
     pub per_unit_concurrency: u64,
     /// Number of slowest units (by per-unit collection duration) to record in
     /// `UnitsCollectionTimings::slowest_units`. Set to 0 to disable.
+    #[default = 5]
     pub slowest_units_count: u64,
     /// Varlink path only: the longest, in seconds, a `[services]` entry's
     /// `io.systemd.Unit.List` reply is reused across cycles. Entries are
     /// refetched sooner when the unit changes state or the manager reloads;
     /// this bounds fields that can change without either (e.g. a runtime
     /// `WATCHDOG_USEC=` notify). 0 disables the cache.
+    #[default = 300]
     pub service_details_cache_max_age_secs: u64,
 }
-impl Default for UnitsConfig {
-    fn default() -> Self {
-        UnitsConfig {
-            enabled: true,
-            varlink: true,
-            failed_families: BTreeMap::new(),
-            state_stats: false,
-            state_stats_allowlist: HashSet::new(),
-            state_stats_blocklist: HashSet::new(),
-            state_stats_time_in_state: true,
-            boot_grace: BTreeMap::new(),
-            ignore_inactive_oneshot_services: true,
-            unit_files: true,
-            per_unit_concurrency: 8,
-            slowest_units_count: 5,
-            service_details_cache_max_age_secs: 300,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct MachinesConfig {
+    #[default = true]
     pub enabled: bool,
     /// Use varlink APIs inside containers when the global `[varlink]`
     /// switch is on. Default true: set false to keep all container
@@ -189,24 +146,17 @@ pub struct MachinesConfig {
     /// matching collector section's own `varlink` toggle. Container varlink
     /// connects from inside the container's PID namespace (see
     /// `crate::varlink::machine_connector`), which needs `CAP_SYS_ADMIN`.
+    #[default = true]
     pub varlink: bool,
     pub allowlist: HashSet<String>,
     pub blocklist: HashSet<String>,
 }
-impl Default for MachinesConfig {
-    fn default() -> Self {
-        MachinesConfig {
-            enabled: true,
-            varlink: true,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct DBusStatsConfig {
+    #[default = true]
     pub enabled: bool,
+    #[default = true]
     pub stale_fd_stats: bool,
 
     pub user_stats: bool,
@@ -221,81 +171,42 @@ pub struct DBusStatsConfig {
     /// when resolving peer names. Bounded (rather than unbounded) for the same
     /// reason as `UnitsConfig::per_unit_concurrency`: a burst of simultaneous
     /// D-Bus calls can itself worsen host-level IPC contention.
+    #[default = 8]
     pub peer_name_concurrency: u64,
 
     pub cgroup_stats: bool,
     pub cgroup_allowlist: HashSet<String>,
     pub cgroup_blocklist: HashSet<String>,
 }
-impl Default for DBusStatsConfig {
-    fn default() -> Self {
-        DBusStatsConfig {
-            enabled: true,
-            stale_fd_stats: true,
 
-            user_stats: false,
-            user_allowlist: HashSet::new(),
-            user_blocklist: HashSet::new(),
-
-            peer_stats: false,
-            peer_well_known_names_only: false,
-            peer_allowlist: HashSet::new(),
-            peer_blocklist: HashSet::new(),
-            peer_name_concurrency: 8,
-
-            cgroup_stats: false,
-            cgroup_allowlist: HashSet::new(),
-            cgroup_blocklist: HashSet::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct BootBlameConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
+    #[default = true]
     pub cache_enabled: bool,
+    #[default = "/run/monitord"]
     pub cache_dir: String,
+    #[default = 5]
     pub num_slowest_units: u64,
     pub allowlist: HashSet<String>,
     pub blocklist: HashSet<String>,
 }
-impl Default for BootBlameConfig {
-    fn default() -> Self {
-        BootBlameConfig {
-            enabled: false,
-            varlink: true,
-            cache_enabled: true,
-            cache_dir: "/run/monitord".to_string(),
-            num_slowest_units: 5,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, SmartDefault)]
 pub struct VerifyConfig {
     pub enabled: bool,
     /// Use varlink APIs for this collector when the global `[varlink]`
     /// switch is on. Default true: set false to keep this collector on
     /// D-Bus while the rest move to varlink.
+    #[default = true]
     pub varlink: bool,
     pub allowlist: HashSet<String>,
     pub blocklist: HashSet<String>,
-}
-impl Default for VerifyConfig {
-    fn default() -> Self {
-        VerifyConfig {
-            enabled: false,
-            varlink: true,
-            allowlist: HashSet::new(),
-            blocklist: HashSet::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
