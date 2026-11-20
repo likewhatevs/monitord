@@ -323,6 +323,9 @@ pub struct UnitDiscovery {
     pub timer_names: Vec<String>,
     /// `io.systemd.Manager.ReloadCount`, which invalidates every reload cache.
     pub reload_count: Option<u64>,
+    /// Monotonic microseconds when the manager last started loading units, including at boot.
+    /// Available in the manager metrics from systemd v262.
+    pub units_load_timestamp_monotonic: Option<u64>,
     /// Realtime `StateChangeTimestamp` of every unit in the stream, which says
     /// whether a cached timer is still current.
     pub state_changes: HashMap<String, u64>,
@@ -346,20 +349,20 @@ const ENDPOINT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// serves those one at a time, so every lookup skipped here is PID 1 time saved
 /// on each cycle.
 ///
-/// Entries live as long as `ReloadCount` holds still. Compared with `!=` since a
-/// `daemon-reexec` resets it to 0 rather than bumping it. Only units used last
-/// cycle are kept, so one that ran or went away since is asked about again.
+/// Entries live while the manager's reload count and unit-load timestamp
+/// hold still. Only units used last cycle are kept.
 ///
 /// A process static because the exporter calls `stat_collector` once per scrape,
 /// so nothing owned by that call would outlive a cycle.
 #[derive(Debug, smart_default::SmartDefault)]
 struct ReloadCache<V> {
-    endpoints: HashMap<String, (u64, HashMap<String, V>, Instant)>,
+    endpoints: HashMap<String, (ReloadGeneration, HashMap<String, V>, Instant)>,
 }
 
 /// Oneshot verdicts. The oneshot override wants `Service.Type` for every
 /// inactive service: on a host with 103 of them that is ~140ms of PID 1 a cycle.
-static ONESHOT_TYPE_CACHE: LazyLock<Mutex<ReloadCache<bool>>> = LazyLock::new(Mutex::default);
+static ONESHOT_TYPE_CACHE: LazyLock<Mutex<ReloadCache<(u64, bool)>>> =
+    LazyLock::new(Mutex::default);
 
 /// Timer stats. Each timer costs two lookups, itself and the unit it triggers:
 /// on a host with 26 timers that is ~80ms of PID 1 a cycle.
@@ -382,27 +385,27 @@ fn lock_cache<V>(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The `ReloadCount` to key every reload cache on, or None to skip them.
-///
-/// PID 1 does not serialize `ReloadCount`, so a `daemon-reexec` resets it to 0.
-/// From a nonzero count that is a change like any reload, but from 0 it is
-/// not, and a reexec keeps every unit's StateChangeTimestamp while timers
-/// re-enter waiting with a freshly drawn `RandomizedDelaySec`. A count of 0
-/// therefore can't tell us a cached deadline is still right. The same goes for
-/// a service's config fields (`RestartUSec`, `WatchdogUSec`, `Type`, ...),
-/// which a reexec re-reads from disk. Hosts leave 0 at their first reload, so
-/// this costs the caches little in practice.
-fn nonzero_reload_count(reload_count: Option<u64>) -> Option<u64> {
-    reload_count.filter(|&count| count != 0)
+/// Older managers only expose the count. A reexec can leave it at zero while
+/// re-reading service properties and drawing new randomized timer deadlines.
+type ReloadGeneration = (u64, Option<u64>);
+
+fn valid_load_timestamp(usec: &u64) -> bool {
+    !matches!(*usec, 0 | u64::MAX)
+}
+
+fn reload_generation(count: Option<u64>, units_load: Option<u64>) -> Option<ReloadGeneration> {
+    let count = count?;
+    let units_load = units_load.filter(valid_load_timestamp);
+    (count != 0 || units_load.is_some()).then_some((count, units_load))
 }
 
 impl<V> ReloadCache<V> {
     /// Hand over what is still valid for `endpoint`, leaving nothing behind:
     /// `store` puts back the set this cycle actually used.
-    fn take(&mut self, endpoint: &str, reload_count: Option<u64>) -> HashMap<String, V> {
-        match (self.endpoints.remove(endpoint), reload_count) {
-            (Some((cached_count, entries, _)), Some(reload_count))
-                if cached_count == reload_count =>
+    fn take(&mut self, endpoint: &str, generation: Option<ReloadGeneration>) -> HashMap<String, V> {
+        match (self.endpoints.remove(endpoint), generation) {
+            (Some((cached_generation, entries, _)), Some(generation))
+                if cached_generation == generation =>
             {
                 entries
             }
@@ -410,11 +413,16 @@ impl<V> ReloadCache<V> {
         }
     }
 
-    /// Without a usable `ReloadCount` nothing could ever invalidate the entry,
+    /// Without a usable generation nothing could ever invalidate the entry,
     /// so it is not kept.
-    fn store(&mut self, endpoint: String, reload_count: Option<u64>, entries: HashMap<String, V>) {
-        let Some(reload_count) = reload_count else {
-            debug!("No usable ReloadCount, not caching unit details for {endpoint}");
+    fn store(
+        &mut self,
+        endpoint: String,
+        generation: Option<ReloadGeneration>,
+        entries: HashMap<String, V>,
+    ) {
+        let Some(generation) = generation else {
+            debug!("No usable reload generation, not caching unit details for {endpoint}");
             return;
         };
         if entries.is_empty() {
@@ -429,9 +437,19 @@ impl<V> ReloadCache<V> {
                 return;
             }
         }
-        self.endpoints
-            .insert(endpoint, (reload_count, entries, now));
+        self.endpoints.insert(endpoint, (generation, entries, now));
     }
+}
+
+/// A transient unit can be replaced under the same name between two sweeps,
+/// including before it has a state-change timestamp. Cache only replies that
+/// the manager identifies as persistent.
+fn is_persistent_unit(output: &crate::varlink::unit::ListOutput) -> bool {
+    output
+        .context
+        .as_ref()
+        .and_then(|context| context.transient)
+        == Some(false)
 }
 
 /// A timer's stats, and the state change timestamps they were read under.
@@ -510,6 +528,9 @@ impl CachedService {
         fetched_at: Instant,
         output: crate::varlink::unit::ListOutput,
     ) -> Option<Self> {
+        if !is_persistent_unit(&output) {
+            return None;
+        }
         Some(Self {
             state_changed: *state_changes.get(name)?,
             fetched_at,
@@ -616,7 +637,16 @@ pub async fn parse_metrics(
     let has_load_state_totals = metrics
         .iter()
         .any(|metric| metric.name_suffix() == "UnitsByLoadStateTotal");
+    let mut first_load = None;
+    let mut last_load = None;
     for metric in metrics.iter() {
+        match metric.name() {
+            "io.systemd.Manager.UnitsLoadStartTimestamp.Monotonic" => {
+                first_load = Some(metric.value())
+            }
+            "io.systemd.Manager.UnitsLoadTimestamp.Monotonic" => last_load = Some(metric.value()),
+            _ => {}
+        }
         parse_one_metric(stats, metric, config, services, has_load_state_totals)?;
     }
     // Timer units are enumerated from the metrics we already have rather than
@@ -668,6 +698,12 @@ pub async fn parse_metrics(
     Ok(UnitDiscovery {
         timer_names: timer_names.into_iter().collect(),
         reload_count,
+        // A manager started without serialized state has no last-load timestamp
+        // until its first reload or reexec, but it does have its first-load timestamp.
+        units_load_timestamp_monotonic: last_load
+            .or(first_load)
+            .and_then(|value| value.as_u64())
+            .filter(valid_load_timestamp),
         state_changes,
         nrestarts,
         status_errno,
@@ -817,10 +853,13 @@ pub async fn apply_unit_details(
     // unit holds its state (see `CachedService`), else over varlink
     // (sequential — PID 1 serves these one at a time).
     let service_max_age = Duration::from_secs(config.units.service_details_cache_max_age_secs);
-    let service_reload_count =
-        nonzero_reload_count(discovery.reload_count).filter(|_| !service_max_age.is_zero());
+    let generation = reload_generation(
+        discovery.reload_count,
+        discovery.units_load_timestamp_monotonic,
+    );
+    let service_generation = generation.filter(|_| !service_max_age.is_zero());
     let mut known_services =
-        lock_cache(&SERVICE_DETAILS_CACHE).take(&cache_key, service_reload_count);
+        lock_cache(&SERVICE_DETAILS_CACHE).take(&cache_key, service_generation);
     let mut service_outputs: Vec<(String, crate::varlink::unit::ListOutput, Instant)> = Vec::new();
     let mut services_from_cache: u64 = 0;
     for name in &config.services {
@@ -904,35 +943,47 @@ pub async fn apply_unit_details(
     }
     lock_cache(&SERVICE_DETAILS_CACHE).store(
         cache_key.clone(),
-        service_reload_count,
+        service_generation,
         cached_services,
     );
 
-    // Type= is re-read from disk on a reexec too, which leaves a count of 0 at 0.
-    let oneshot_reload_count = nonzero_reload_count(discovery.reload_count);
-    let known_types = lock_cache(&ONESHOT_TYPE_CACHE).take(&cache_key, oneshot_reload_count);
-    let mut oneshot_types: HashMap<String, bool> = HashMap::new();
+    let known_types = lock_cache(&ONESHOT_TYPE_CACHE).take(&cache_key, generation);
+    let mut cached_types = HashMap::new();
+    let mut types_from_cache = 0;
+    let mut oneshot_types = HashMap::new();
     for name in candidates {
-        if let Some(is_oneshot) = known_types.get(&name) {
-            oneshot_types.insert(name, *is_oneshot);
-        } else if let Some(output) = lookup.get(&name).await? {
-            let output = output.clone();
-            require_unit_context(&name, &output)?;
-            oneshot_types.insert(name, crate::varlink_unit::is_oneshot(&output));
-        }
+        let state_changed = discovery
+            .state_changes
+            .get(&name)
+            .copied()
+            .filter(|&s| s != u64::MAX);
+        let cached = known_types
+            .get(&name)
+            .filter(|(stamp, _)| Some(*stamp) == state_changed);
+        let kind = if let Some(&entry) = cached {
+            types_from_cache += 1;
+            cached_types.insert(name.clone(), entry);
+            entry.1
+        } else {
+            let Some(output) = lookup.get(&name).await? else {
+                continue;
+            };
+            require_unit_context(&name, output)?;
+            let kind = crate::varlink_unit::is_oneshot(output);
+            if let Some(stamp) = state_changed.filter(|_| is_persistent_unit(output)) {
+                cached_types.insert(name.clone(), (stamp, kind));
+            }
+            kind
+        };
+        oneshot_types.insert(name, kind);
     }
-    lock_cache(&ONESHOT_TYPE_CACHE).store(
-        cache_key.clone(),
-        oneshot_reload_count,
-        oneshot_types.clone(),
-    );
+    lock_cache(&ONESHOT_TYPE_CACHE).store(cache_key.clone(), generation, cached_types);
 
     // Timers need a second unit each — the one they trigger — for its state
     // change timestamps. That unit is often already in [services], which is
     // where the lookup cache earns its place. A timer whose two units have not
     // changed state since last cycle skips both lookups (see `CachedTimer`).
-    let timer_reload_count = nonzero_reload_count(discovery.reload_count);
-    let known_timers = lock_cache(&TIMER_STATS_CACHE).take(&cache_key, timer_reload_count);
+    let known_timers = lock_cache(&TIMER_STATS_CACHE).take(&cache_key, generation);
     let mut cached_timers: HashMap<String, CachedTimer> = HashMap::new();
     let mut timer_stats: HashMap<String, TimerStats> = HashMap::new();
     let mut timers_from_cache = 0;
@@ -966,9 +1017,9 @@ pub async fn apply_unit_details(
             }
         };
         let stats = crate::varlink_unit::map_timer_stats(&output, triggered.as_ref());
-        // An unresolved trigger is asked about again rather than cached.
+        // An unresolved trigger or a transient timer is asked about again next cycle.
         if let Some(entry) = triggered_name
-            .filter(|_| triggered.is_some())
+            .filter(|_| is_persistent_unit(&output) && triggered.is_some())
             .and_then(|triggered| {
                 CachedTimer::new(&name, triggered, &discovery.state_changes, stats.clone())
             })
@@ -977,7 +1028,7 @@ pub async fn apply_unit_details(
         }
         timer_stats.insert(name, stats);
     }
-    lock_cache(&TIMER_STATS_CACHE).store(cache_key, timer_reload_count, cached_timers);
+    lock_cache(&TIMER_STATS_CACHE).store(cache_key, generation, cached_timers);
 
     let fetch_elapsed_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
     debug!(
@@ -988,7 +1039,7 @@ pub async fn apply_unit_details(
         config.services.len(),
         services_from_cache,
         oneshot_types.len(),
-        known_types.len(),
+        types_from_cache,
         timer_stats.len(),
         timers_from_cache,
         fetch_elapsed_ms
@@ -1203,12 +1254,78 @@ mod tests {
             .collect()
     }
 
+    fn generation(count: u64) -> Option<ReloadGeneration> {
+        reload_generation(Some(count), None)
+    }
+
+    #[test]
+    fn test_reload_generation_rejects_unset_timestamps() {
+        for timestamp in [None, Some(0), Some(u64::MAX)] {
+            assert_eq!(reload_generation(None, timestamp), None);
+            assert_eq!(reload_generation(Some(0), timestamp), None);
+            assert_eq!(reload_generation(Some(3), timestamp), Some((3, None)));
+        }
+        assert_eq!(reload_generation(None, Some(20)), None);
+    }
+
+    #[tokio::test]
+    async fn test_reload_generation_uses_manager_load_timestamps() {
+        let config = crate::config::Config::default();
+        let mut cache = ReloadCache::<bool>::default();
+        for (count, first_load, last_load, hit) in [
+            (0, None, None, false),
+            (0, Some(10), None, false),
+            (0, Some(10), None, true),
+            (0, Some(10), Some(20), false),
+            (0, Some(10), Some(20), true),
+            (1, Some(10), Some(30), false),
+            (1, Some(10), Some(30), true),
+            (1, Some(10), Some(40), false),
+        ] {
+            let rows = [
+                ("ReloadCount", Some(count)),
+                ("UnitsLoadStartTimestamp.Monotonic", first_load),
+                ("UnitsLoadTimestamp.Monotonic", last_load),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| {
+                Some(ListOutput {
+                    name: format!("io.systemd.Manager.{name}"),
+                    value: serde_json::json!(value?),
+                    object: None,
+                    fields: None,
+                })
+            })
+            .collect();
+            let metrics = futures_util::future::ready(Ok(Arc::new(rows)))
+                .boxed()
+                .shared();
+            let (_, discovery) = get_unit_stats(&config, metrics).await.unwrap();
+            let generation = reload_generation(
+                discovery.reload_count,
+                discovery.units_load_timestamp_monotonic,
+            );
+            assert_eq!(
+                cache.take("host", generation).contains_key("a.service"),
+                hit
+            );
+            cache.store("host".into(), generation, types(&[("a.service", true)]));
+        }
+    }
+
     #[test]
     fn test_oneshot_cache_hits_while_reload_count_holds() {
         let mut cache = ReloadCache::<bool>::default();
-        assert!(cache.take("host", Some(9)).is_empty());
-        cache.store("host".to_string(), Some(9), types(&[("a.service", true)]));
-        assert_eq!(cache.take("host", Some(9)), types(&[("a.service", true)]));
+        assert!(cache.take("host", generation(9)).is_empty());
+        cache.store(
+            "host".to_string(),
+            generation(9),
+            types(&[("a.service", true)]),
+        );
+        assert_eq!(
+            cache.take("host", generation(9)),
+            types(&[("a.service", true)])
+        );
     }
 
     #[test]
@@ -1217,8 +1334,12 @@ mod tests {
         // going backwards has to invalidate just the same.
         for next in [10, 0] {
             let mut cache = ReloadCache::<bool>::default();
-            cache.store("host".to_string(), Some(9), types(&[("a.service", true)]));
-            assert!(cache.take("host", Some(next)).is_empty());
+            cache.store(
+                "host".to_string(),
+                generation(9),
+                types(&[("a.service", true)]),
+            );
+            assert!(cache.take("host", generation(next)).is_empty());
         }
     }
 
@@ -1228,16 +1349,24 @@ mod tests {
         let mut cache = ReloadCache::<bool>::default();
         cache.store("host".to_string(), None, types(&[("a.service", true)]));
         assert!(cache.take("host", None).is_empty());
-        cache.store("host".to_string(), Some(1), types(&[("a.service", true)]));
+        cache.store(
+            "host".to_string(),
+            generation(1),
+            types(&[("a.service", true)]),
+        );
         assert!(cache.take("host", None).is_empty());
     }
 
     #[test]
     fn test_oneshot_cache_keeps_endpoints_apart() {
         let mut cache = ReloadCache::<bool>::default();
-        cache.store("host".to_string(), Some(1), types(&[("a.service", true)]));
-        assert!(cache.take("machine", Some(1)).is_empty());
-        assert!(!cache.take("host", Some(1)).is_empty());
+        cache.store(
+            "host".to_string(),
+            generation(1),
+            types(&[("a.service", true)]),
+        );
+        assert!(cache.take("machine", generation(1)).is_empty());
+        assert!(!cache.take("host", generation(1)).is_empty());
     }
 
     #[test]
@@ -1246,11 +1375,11 @@ mod tests {
         for leader in 0..MAX_CACHED_ENDPOINTS {
             cache.store(
                 format!("machine {leader}"),
-                Some(1),
+                generation(1),
                 types(&[("a.service", true)]),
             );
         }
-        cache.store("extra".into(), Some(1), types(&[("b.service", true)]));
+        cache.store("extra".into(), generation(1), types(&[("b.service", true)]));
         assert!(!cache.endpoints.contains_key("extra"));
         assert_eq!(cache.endpoints.len(), MAX_CACHED_ENDPOINTS);
 
@@ -1259,7 +1388,7 @@ mod tests {
         }
         for leader in 0..MAX_CACHED_ENDPOINTS {
             let name = format!("replacement {leader}");
-            cache.store(name.clone(), Some(1), types(&[("c.service", true)]));
+            cache.store(name.clone(), generation(1), types(&[("c.service", true)]));
             assert!(cache.endpoints.contains_key(&name));
         }
         assert_eq!(cache.endpoints.len(), MAX_CACHED_ENDPOINTS);
@@ -1325,20 +1454,23 @@ mod tests {
         let mut cache = ReloadCache::<CachedTimer>::default();
         cache.store(
             "host".to_string(),
-            Some(3),
+            generation(3),
             HashMap::from([("a.timer".to_string(), entry.clone())]),
         );
-        assert!(cache.take("host", Some(4)).is_empty());
+        assert!(cache.take("host", generation(4)).is_empty());
         cache.store(
             "host".to_string(),
-            Some(4),
+            generation(4),
             HashMap::from([("a.timer".to_string(), entry.clone())]),
         );
-        assert_eq!(cache.take("host", Some(4)).get("a.timer"), Some(&entry));
+        assert_eq!(
+            cache.take("host", generation(4)).get("a.timer"),
+            Some(&entry)
+        );
     }
 
     #[test]
-    fn test_timer_cache_skipped_at_reload_count_zero() {
+    fn test_timer_cache_skipped_at_zero_without_load_timestamp() {
         // A daemon-reexec from ReloadCount 0 leaves it at 0 and keeps both
         // StateChangeTimestamps, yet redraws RandomizedDelaySec.
         let state = changes(&[("a.timer", 100), ("a.service", 90)]);
@@ -1347,19 +1479,42 @@ mod tests {
         let mut cache = ReloadCache::<CachedTimer>::default();
         cache.store(
             "host".to_string(),
-            nonzero_reload_count(Some(0)),
+            generation(0),
             HashMap::from([("a.timer".to_string(), entry.clone())]),
         );
-        assert!(cache.take("host", nonzero_reload_count(Some(0))).is_empty());
-        assert_eq!(nonzero_reload_count(Some(1)), Some(1));
-        assert_eq!(nonzero_reload_count(None), None);
+        assert!(cache.take("host", generation(0)).is_empty());
     }
 
     fn service_reply() -> crate::varlink::unit::ListOutput {
-        crate::varlink::unit::ListOutput {
-            context: None,
-            runtime: None,
+        serde_json::from_value(serde_json::json!({"context": {"Transient": false}})).unwrap()
+    }
+
+    #[test]
+    fn test_cache_skips_transient_and_unidentified_units() {
+        for value in [
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!("unknown"),
+        ] {
+            let output =
+                serde_json::from_value(serde_json::json!({"context": {"Transient": value}}))
+                    .unwrap();
+            assert!(!is_persistent_unit(&output));
+            assert!(CachedService::new(
+                "a.service",
+                &changes(&[("a.service", 0)]),
+                Instant::now(),
+                output
+            )
+            .is_none());
         }
+        let reply: crate::varlink::unit::ListOutput =
+            serde_json::from_value(serde_json::json!({"context": {}})).unwrap();
+        assert!(!is_persistent_unit(&reply));
+        assert!(serde_json::to_value(reply).unwrap()["context"]
+            .get("Transient")
+            .is_none());
+        assert!(is_persistent_unit(&service_reply()));
     }
 
     const MAX_AGE: Duration = Duration::from_secs(300);
@@ -1417,14 +1572,12 @@ mod tests {
             )])
         };
         let mut cache = ReloadCache::<CachedService>::default();
-        cache.store("host".to_string(), nonzero_reload_count(Some(3)), entry());
-        assert!(cache
-            .take("host", nonzero_reload_count(Some(3)))
-            .contains_key("a.service"));
-        cache.store("host".to_string(), nonzero_reload_count(Some(3)), entry());
-        assert!(cache.take("host", nonzero_reload_count(Some(4))).is_empty());
-        cache.store("host".to_string(), nonzero_reload_count(Some(0)), entry());
-        assert!(cache.take("host", nonzero_reload_count(Some(0))).is_empty());
+        cache.store("host".to_string(), generation(3), entry());
+        assert!(cache.take("host", generation(3)).contains_key("a.service"));
+        cache.store("host".to_string(), generation(3), entry());
+        assert!(cache.take("host", generation(4)).is_empty());
+        cache.store("host".to_string(), generation(0), entry());
+        assert!(cache.take("host", generation(0)).is_empty());
     }
 
     #[test]
@@ -1852,6 +2005,7 @@ mod tests {
         // be reached there and has to be pinned here instead.
         let bare = UnitListOutput {
             context: Some(UnitContext {
+                transient: None,
                 service: None,
                 exec: None,
                 timer: None,
@@ -1874,6 +2028,7 @@ mod tests {
         // v261+ replies pass.
         let with_service = UnitListOutput {
             context: Some(UnitContext {
+                transient: None,
                 service: Some(ServiceContext {
                     r#type: Some("simple".to_string()),
                     restart_usec: None,
@@ -1887,6 +2042,7 @@ mod tests {
         assert!(require_unit_context("foo.service", &with_service).is_ok());
         let with_timer = UnitListOutput {
             context: Some(UnitContext {
+                transient: None,
                 service: None,
                 exec: None,
                 timer: Some(TimerContext {

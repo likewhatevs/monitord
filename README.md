@@ -1320,6 +1320,7 @@ toggle of their own: they ride the units path and follow `[units] varlink`.
 - Exact total unit count (`UnitsTotal`, v261+; approximated from mapped per-type counts on v260)
 - Queued job count (`JobsQueued`, v261+; unavailable (0) on v260)
 - Per-unit active state and load state (with allowlist/blocklist filtering)
+- On systemd v262+, the manager’s monotonic unit-load timestamp lets timer, service and oneshot caches distinguish a reexec even before the first daemon-reload. On v261 a zero reload count keeps these caches disabled. A transient unit can be recreated with the same name, so only units reported as non-transient are eligible for reuse between sweeps.
 - Per-unit time in state (`StateChangeTimestamp`, v261+; unavailable on v260)
 - Per-unit health status (computed from active + load state)
 - Per-service restart counts (`nrestarts`)
