@@ -167,105 +167,29 @@ fn flatten_services(
     flat_stats
 }
 
-fn flatten_timers(
-    timer_stats_hash: &HashMap<String, crate::timer::TimerStats>,
+fn flatten_unit_fields<T: serde::Serialize>(
+    stats_by_unit: &HashMap<String, T>,
     key_prefix: &str,
+    metric_name: &str,
 ) -> Vec<(String, serde_json::Value)> {
     let mut flat_stats = Vec::new();
-    let base_metric_name = gen_base_metric_key(key_prefix, "timers");
+    let base_metric_name = gen_base_metric_key(key_prefix, metric_name);
 
-    for (timer_name, timer_stats) in timer_stats_hash.iter() {
-        if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(timer_stats) {
-            for (field_name, value) in map {
-                let key = format!("{base_metric_name}.{timer_name}.{field_name}");
-                if value.is_number() {
-                    flat_stats.push((key, value));
-                } else if let Some(b) = value.as_bool() {
-                    flat_stats.push((key, (b as u64).into()));
-                }
-            }
+    for (unit_name, stats) in stats_by_unit {
+        let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(stats) else {
+            continue;
+        };
+        for (field_name, value) in fields {
+            let value = match value {
+                serde_json::Value::Number(_) => value,
+                serde_json::Value::Bool(b) => u64::from(b).into(),
+                _ => continue,
+            };
+            let key = format!("{base_metric_name}.{unit_name}.{field_name}");
+            flat_stats.push((key, value));
         }
     }
     flat_stats
-}
-
-fn flatten_unit_states(
-    unit_states_hash: &HashMap<String, units::UnitStates>,
-    key_prefix: &str,
-) -> Vec<(String, serde_json::Value)> {
-    let mut flat_stats = Vec::new();
-    let base_metric_name = gen_base_metric_key(key_prefix, "unit_states");
-
-    for (unit_name, unit_state_stats) in unit_states_hash.iter() {
-        if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(unit_state_stats) {
-            for (field_name, value) in map {
-                let key = format!("{base_metric_name}.{unit_name}.{field_name}");
-                if value.is_number() {
-                    flat_stats.push((key, value));
-                } else if let Some(b) = value.as_bool() {
-                    flat_stats.push((key, (b as u64).into()));
-                }
-            }
-        }
-    }
-
-    flat_stats
-}
-
-/// Lightweight view of `SystemdUnitStats` containing only the numeric counters.
-/// Used by `flatten_units` to avoid serializing the nested `service_stats`,
-/// `timer_stats`, and `unit_states` hashmaps, keeping flattening O(number_of_counters).
-#[derive(serde::Serialize)]
-struct UnitCounters {
-    activating_units: u64,
-    active_units: u64,
-    automount_units: u64,
-    device_units: u64,
-    failed_units: u64,
-    inactive_units: u64,
-    jobs_queued: u64,
-    loaded_units: u64,
-    masked_units: u64,
-    mount_units: u64,
-    not_found_units: u64,
-    path_units: u64,
-    scope_units: u64,
-    service_units: u64,
-    slice_units: u64,
-    socket_units: u64,
-    target_units: u64,
-    timer_units: u64,
-    timer_persistent_units: u64,
-    timer_remain_after_elapse: u64,
-    total_units: u64,
-}
-
-impl From<&units::SystemdUnitStats> for UnitCounters {
-    fn from(s: &units::SystemdUnitStats) -> Self {
-        Self {
-            activating_units: s.activating_units,
-            active_units: s.active_units,
-            automount_units: s.automount_units,
-            device_units: s.device_units,
-            failed_units: s.failed_units,
-            inactive_units: s.inactive_units,
-            jobs_queued: s.jobs_queued,
-            loaded_units: s.loaded_units,
-            masked_units: s.masked_units,
-            mount_units: s.mount_units,
-            not_found_units: s.not_found_units,
-            path_units: s.path_units,
-            scope_units: s.scope_units,
-            service_units: s.service_units,
-            slice_units: s.slice_units,
-            socket_units: s.socket_units,
-            target_units: s.target_units,
-            timer_units: s.timer_units,
-            timer_persistent_units: s.timer_persistent_units,
-            timer_remain_after_elapse: s.timer_remain_after_elapse,
-            total_units: s.total_units,
-        }
-    }
 }
 
 fn flatten_units(
@@ -275,15 +199,33 @@ fn flatten_units(
     let mut flat_stats = Vec::new();
     let base_metric_name = gen_base_metric_key(key_prefix, "units");
 
-    if let Ok(serde_json::Value::Object(map)) =
-        serde_json::to_value(UnitCounters::from(units_stats))
-    {
-        for (field_name, value) in map {
-            if value.is_number() {
-                let key = format!("{base_metric_name}.{field_name}");
-                flat_stats.push((key, value));
-            }
-        }
+    for (name, count) in [
+        ("activating_units", units_stats.activating_units),
+        ("active_units", units_stats.active_units),
+        ("automount_units", units_stats.automount_units),
+        ("device_units", units_stats.device_units),
+        ("failed_units", units_stats.failed_units),
+        ("inactive_units", units_stats.inactive_units),
+        ("jobs_queued", units_stats.jobs_queued),
+        ("loaded_units", units_stats.loaded_units),
+        ("masked_units", units_stats.masked_units),
+        ("mount_units", units_stats.mount_units),
+        ("not_found_units", units_stats.not_found_units),
+        ("path_units", units_stats.path_units),
+        ("scope_units", units_stats.scope_units),
+        ("service_units", units_stats.service_units),
+        ("slice_units", units_stats.slice_units),
+        ("socket_units", units_stats.socket_units),
+        ("target_units", units_stats.target_units),
+        ("timer_persistent_units", units_stats.timer_persistent_units),
+        (
+            "timer_remain_after_elapse",
+            units_stats.timer_remain_after_elapse,
+        ),
+        ("timer_units", units_stats.timer_units),
+        ("total_units", units_stats.total_units),
+    ] {
+        flat_stats.push((format!("{base_metric_name}.{name}"), count.into()));
     }
     for (family, count) in &units_stats.failed_families {
         flat_stats.push((
@@ -332,9 +274,10 @@ fn flatten_machines(
             &stats.units.service_stats,
             &machine_key_prefix,
         ));
-        flat_stats.extend(flatten_timers(
+        flat_stats.extend(flatten_unit_fields(
             &stats.units.timer_stats,
             &machine_key_prefix,
+            "timers",
         ));
         flat_stats.extend(flatten_boot_blame(&stats.boot_blame, &machine_key_prefix));
         flat_stats.extend(flatten_verify_stats(
@@ -702,10 +645,15 @@ fn flatten_stats(
         &stats_struct.units.service_stats,
         key_prefix,
     ));
-    flat_stats.extend(flatten_timers(&stats_struct.units.timer_stats, key_prefix));
-    flat_stats.extend(flatten_unit_states(
+    flat_stats.extend(flatten_unit_fields(
+        &stats_struct.units.timer_stats,
+        key_prefix,
+        "timers",
+    ));
+    flat_stats.extend(flatten_unit_fields(
         &stats_struct.units.unit_states,
         key_prefix,
+        "unit_states",
     ));
     flat_stats.extend(flatten_units(&stats_struct.units, key_prefix));
     flat_stats.extend(flatten_unit_files(
@@ -1306,13 +1254,8 @@ mod tests {
         }
     }
 
-    /// Ensure `UnitCounters` covers every scalar (non-hashmap) field of `SystemdUnitStats`.
-    ///
-    /// If a new counter field is added to `SystemdUnitStats` but not to `UnitCounters`
-    /// (and its `From` impl), this test will fail, preventing silent omissions from the
-    /// flat JSON output.
     #[test]
-    fn test_unit_counters_covers_all_scalar_fields() {
+    fn test_flatten_units_covers_all_scalar_fields() {
         // Fields of SystemdUnitStats that are nested maps, not scalar counters.
         const NON_COUNTER_FIELDS: &[&str] = &[
             "failed_families",
@@ -1323,32 +1266,19 @@ mod tests {
             "collection_timings",
         ];
 
-        // Scalar counter field names expected from SystemdUnitStats.
-        let expected: std::collections::BTreeSet<&str> = units::UNIT_FIELD_NAMES
+        let expected: std::collections::BTreeSet<_> = units::UNIT_FIELD_NAMES
             .iter()
-            .copied()
-            .filter(|f| !NON_COUNTER_FIELDS.contains(f))
+            .filter(|field| !NON_COUNTER_FIELDS.contains(field))
+            .map(|field| format!("units.{field}"))
             .collect();
-
-        // Field names actually present in UnitCounters (via serde serialization).
-        let counters_json =
-            serde_json::to_value(UnitCounters::from(&units::SystemdUnitStats::default()))
-                .expect("UnitCounters serialization failed");
-        let actual: std::collections::BTreeSet<&str> = counters_json
-            .as_object()
-            .expect("UnitCounters must serialize to a JSON object")
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
-
-        assert_eq!(
-            expected,
-            actual,
-            "UnitCounters is out of sync with SystemdUnitStats scalar fields.\n\
-             Missing from UnitCounters: {:?}\n\
-             Extra in UnitCounters: {:?}",
-            expected.difference(&actual).collect::<Vec<_>>(),
-            actual.difference(&expected).collect::<Vec<_>>(),
-        );
+        let actual: std::collections::BTreeSet<_> =
+            flatten_units(&units::SystemdUnitStats::default(), "")
+                .into_iter()
+                .map(|(key, value)| {
+                    assert!(value.is_u64(), "{key}: {value}");
+                    key
+                })
+                .collect();
+        assert_eq!(actual, expected);
     }
 }
