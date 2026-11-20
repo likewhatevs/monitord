@@ -51,21 +51,12 @@ fn collect_activations(
         if !config.allowlist.is_empty() && !config.allowlist.contains(unit_name) {
             continue;
         }
-        if !metric.value().is_i64() {
+        let Some(value) = metric.value().as_u64() else {
             debug!(
-                "Skipping {} for {}: non-integer value {:?}",
+                "Skipping {} for {}: expected an unsigned timestamp, got {:?}",
                 metric.name(),
                 unit_name,
                 metric.value()
-            );
-            continue;
-        }
-        let Ok(value) = u64::try_from(metric.value_as_int()) else {
-            debug!(
-                "Skipping {} for {}: negative value {}",
-                metric.name(),
-                unit_name,
-                metric.value_as_int()
             );
             continue;
         };
@@ -152,7 +143,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn metric(name: &str, unit: &str, value: i64, event: Option<&str>) -> ListOutput {
+    fn metric(name: &str, unit: &str, value: u64, event: Option<&str>) -> ListOutput {
         ListOutput {
             name: format!("io.systemd.Manager.{name}"),
             value: serde_json::json!(value),
@@ -163,7 +154,7 @@ mod tests {
         }
     }
 
-    fn unit_metrics(unit: &str, inactive_exit: i64, active_enter: i64) -> Vec<ListOutput> {
+    fn unit_metrics(unit: &str, inactive_exit: u64, active_enter: u64) -> Vec<ListOutput> {
         vec![
             metric("InactiveExitTimestamp", unit, inactive_exit, None),
             metric("ActiveTimestamp", unit, active_enter, Some("enter")),
@@ -183,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_ranks_slowest_units_first() {
-        let mut metrics = unit_metrics("slow.service", 1_000_000, 4_000_000);
+        let mut metrics = unit_metrics("slow.service", u64::MAX - 3_000_000, u64::MAX);
         metrics.extend(unit_metrics("quick.service", 1_000_000, 1_500_000));
         metrics.extend(unit_metrics("middling.service", 1_000_000, 3_000_000));
 
