@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use futures_util::{stream, StreamExt};
 use thiserror::Error;
@@ -330,31 +330,33 @@ fn proc_cmdline_args(path: &Path) -> io::Result<Vec<String>> {
         .collect())
 }
 
-fn proc_pid_dirs(proc_root: &Path) -> io::Result<Vec<(u32, std::path::PathBuf)>> {
-    let mut result = Vec::new();
-    for entry in fs::read_dir(proc_root)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        result.push((pid, entry.path()));
-    }
-    Ok(result)
+fn is_broker_cmdline(path: &Path) -> bool {
+    proc_cmdline_args(&path.join("cmdline"))
+        .is_ok_and(|args| args.first().is_some_and(|arg| arg.ends_with("dbus-broker")))
 }
 
-fn find_system_dbus_broker_pid(proc_root: &Path) -> io::Result<Option<u32>> {
-    for (pid, path) in proc_pid_dirs(proc_root)? {
-        let Ok(args) = proc_cmdline_args(&path.join("cmdline")) else {
-            continue;
-        };
-        if !args.first().is_some_and(|arg| arg.ends_with("dbus-broker")) {
+fn proc_fd_path(dir: &fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+
+fn find_system_dbus_broker(proc_root: &Path) -> io::Result<Option<fs::File>> {
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        if !name.as_encoded_bytes().iter().all(u8::is_ascii_digit) || !is_broker_cmdline(&path) {
             continue;
         }
 
+        // Pin the candidate and recheck its identity. The numeric PID can be
+        // reused between reads, including while we walk its descriptors.
+        let Ok(dir) = fs::File::open(path) else {
+            continue;
+        };
+        let path = proc_fd_path(&dir);
+        if !is_broker_cmdline(&path) {
+            continue;
+        }
         let Ok(stat) = fs::read_to_string(path.join("stat")) else {
             continue;
         };
@@ -371,7 +373,7 @@ fn find_system_dbus_broker_pid(proc_root: &Path) -> io::Result<Option<u32>> {
             && (parent.windows(2).any(|args| args == ["--scope", "system"])
                 || parent.iter().any(|arg| arg == "--scope=system"))
         {
-            return Ok(Some(pid));
+            return Ok(Some(dir));
         }
     }
 
@@ -397,9 +399,10 @@ fn is_stale_pidfd(fd_path: &Path, fdinfo_path: &Path) -> bool {
     })
 }
 
-fn count_stale_pidfds(proc_root: &Path, pid: u32) -> io::Result<u32> {
-    let fd_dir = proc_root.join(pid.to_string()).join("fd");
-    let fdinfo_dir = proc_root.join(pid.to_string()).join("fdinfo");
+fn count_stale_pidfds(dir: &fs::File) -> io::Result<u32> {
+    let path = proc_fd_path(dir);
+    let fd_dir = path.join("fd");
+    let fdinfo_dir = path.join("fdinfo");
     let mut count: u32 = 0;
 
     for entry in fs::read_dir(fdinfo_dir)? {
@@ -414,63 +417,52 @@ fn count_stale_pidfds(proc_root: &Path, pid: u32) -> io::Result<u32> {
     Ok(count)
 }
 
-#[cfg(test)]
-fn collect_system_dbus_broker_stale_fds_from_proc(proc_root: &Path) -> io::Result<Option<u32>> {
-    let Some(pid) = find_system_dbus_broker_pid(proc_root)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(count_stale_pidfds(proc_root, pid)?))
-}
-
 fn collect_system_dbus_broker_stale_fds_with_cache(
     proc_root: &Path,
-    broker_pid_cache: &Mutex<Option<u32>>,
+    broker_cache: &Mutex<Option<Arc<fs::File>>>,
 ) -> io::Result<Option<u32>> {
-    let cached_pid = *broker_pid_cache
-        .lock()
-        .map_err(|_| io::Error::other("dbus-broker pid cache poisoned"))?;
-
-    if let Some(pid) = cached_pid {
-        match count_stale_pidfds(proc_root, pid) {
+    let lock_cache = || {
+        broker_cache
+            .lock()
+            .map_err(|_| io::Error::other("dbus-broker cache poisoned"))
+    };
+    let cached = lock_cache()?.clone();
+    if let Some(dir) = cached {
+        match count_stale_pidfds(&dir) {
             Ok(count) => return Ok(Some(count)),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if let Ok(mut cached_pid) = broker_pid_cache.lock() {
-                    if *cached_pid == Some(pid) {
-                        *cached_pid = None;
-                    }
+            Err(err) if proc_entry_gone(&err) => {
+                let mut cached = lock_cache()?;
+                if cached
+                    .as_ref()
+                    .is_some_and(|other| Arc::ptr_eq(other, &dir))
+                {
+                    *cached = None;
                 }
             }
             Err(err) => return Err(err),
         }
     }
 
-    let Some(pid) = find_system_dbus_broker_pid(proc_root)? else {
+    let Some(dir) = find_system_dbus_broker(proc_root)? else {
         return Ok(None);
     };
-
-    let count = count_stale_pidfds(proc_root, pid)?;
-    let mut cached_pid = broker_pid_cache
-        .lock()
-        .map_err(|_| io::Error::other("dbus-broker pid cache poisoned"))?;
-    *cached_pid = Some(pid);
-
+    let count = count_stale_pidfds(&dir)?;
+    *lock_cache()? = Some(Arc::new(dir));
     Ok(Some(count))
 }
 
+fn proc_entry_gone(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
 fn is_expected_procfs_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-    )
+    proc_entry_gone(err) || err.kind() == io::ErrorKind::PermissionDenied
 }
 
 fn collect_system_dbus_broker_stale_fds() -> Option<u32> {
-    static SYSTEM_DBUS_BROKER_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+    static SYSTEM_DBUS_BROKER: Mutex<Option<Arc<fs::File>>> = Mutex::new(None);
 
-    let broker_pid_cache = SYSTEM_DBUS_BROKER_PID.get_or_init(|| Mutex::new(None));
-
-    match collect_system_dbus_broker_stale_fds_with_cache(Path::new("/proc"), broker_pid_cache) {
+    match collect_system_dbus_broker_stale_fds_with_cache(Path::new("/proc"), &SYSTEM_DBUS_BROKER) {
         Ok(stale_fds) => stale_fds,
         Err(err) => {
             if is_expected_procfs_error(&err) {
@@ -967,10 +959,29 @@ mod tests {
             "Pid:\t-1\nNSpid:\t-1\n",
         );
 
-        assert_eq!(
-            collect_system_dbus_broker_stale_fds_from_proc(proc_root).expect("collect stale fds"),
-            Some(1)
-        );
+        let cache = Mutex::new(None);
+        let collect =
+            || collect_system_dbus_broker_stale_fds_with_cache(proc_root, &cache).unwrap();
+        assert_eq!(collect(), Some(1));
+        assert_eq!(collect(), Some(1));
+    }
+
+    #[test]
+    fn test_cached_broker_ignores_reused_pid() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let cache = Mutex::new(None);
+        let collect = || collect_system_dbus_broker_stale_fds_with_cache(root, &cache).unwrap();
+        write_fake_proc_process(root, 10, 1, &["dbus-broker-launch", "--scope=system"]);
+        write_fake_proc_process(root, 11, 10, &["dbus-broker"]);
+        assert_eq!(collect(), Some(0));
+
+        fs::remove_dir_all(root.join("11")).unwrap();
+        write_fake_proc_process(root, 11, 1, &["another-process"]);
+        write_fake_fd(root, 11, 0, "anon_inode:[pidfd]", "Pid:\t-1\n");
+        assert_eq!(collect(), None);
+        write_fake_proc_process(root, 12, 10, &["dbus-broker"]);
+        assert_eq!(collect(), Some(0));
     }
 
     #[test]
