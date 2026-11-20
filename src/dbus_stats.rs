@@ -347,52 +347,31 @@ fn proc_pid_dirs(proc_root: &Path) -> io::Result<Vec<(u32, std::path::PathBuf)>>
 }
 
 fn find_system_dbus_broker_pid(proc_root: &Path) -> io::Result<Option<u32>> {
-    let pid_dirs = proc_pid_dirs(proc_root)?;
-    let mut launcher_pids = Vec::new();
-
-    for (pid, path) in &pid_dirs {
-        let args = match proc_cmdline_args(&path.join("cmdline")) {
-            Ok(args) => args,
-            Err(_) => continue,
+    for (pid, path) in proc_pid_dirs(proc_root)? {
+        let Ok(args) = proc_cmdline_args(&path.join("cmdline")) else {
+            continue;
         };
-
-        let is_system_launcher = args
-            .first()
-            .map(|arg| arg.ends_with("dbus-broker-launch"))
-            .unwrap_or(false)
-            && (args
-                .windows(2)
-                .any(|window| window[0] == "--scope" && window[1] == "system")
-                || args.iter().any(|arg| arg == "--scope=system"));
-
-        if is_system_launcher {
-            launcher_pids.push(*pid);
-        }
-    }
-
-    for (pid, path) in &pid_dirs {
-        let args = match proc_cmdline_args(&path.join("cmdline")) {
-            Ok(args) => args,
-            Err(_) => continue,
-        };
-
-        let is_broker = args
-            .first()
-            .map(|arg| arg.ends_with("dbus-broker"))
-            .unwrap_or(false);
-        if !is_broker {
+        if !args.first().is_some_and(|arg| arg.ends_with("dbus-broker")) {
             continue;
         }
 
-        let stat = match fs::read_to_string(path.join("stat")) {
-            Ok(stat) => stat,
-            Err(_) => continue,
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            continue;
         };
         let Some(ppid) = parse_ppid_from_stat(&stat) else {
             continue;
         };
-        if launcher_pids.contains(&ppid) {
-            return Ok(Some(*pid));
+        let Ok(parent) = proc_cmdline_args(&proc_root.join(ppid.to_string()).join("cmdline"))
+        else {
+            continue;
+        };
+        if parent
+            .first()
+            .is_some_and(|arg| arg.ends_with("dbus-broker-launch"))
+            && (parent.windows(2).any(|args| args == ["--scope", "system"])
+                || parent.iter().any(|arg| arg == "--scope=system"))
+        {
+            return Ok(Some(pid));
         }
     }
 
