@@ -8,6 +8,7 @@ pass/fail — so they get tested here:
     ./varlink_integration_unittests.py
 """
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +51,84 @@ def section_body(conf: str, header: str) -> str:
     """Return one section's lines, bounded at the next section header."""
     body = conf.split(f"{header}\n", 1)[1]
     return body.split("\n[", 1)[0]
+
+
+class ReportCommandOutputTest(unittest.TestCase):
+    def test_command_config_enables_collection_and_preserves_serving(self) -> None:
+        conf = vit.build_command_report_conf("[report]\nenabled = true\ncollect = false\n")
+        self.assertIn("enabled = true", conf)
+        self.assertIn("collect = true", conf)
+        self.assertIn(f"{vit.REPORT_COMMAND_SOURCE} = {vit.REPORT_COMMAND_HELPER}", conf)
+
+    def test_requires_successful_zero_socket_sample(self) -> None:
+        prefix = f"monitord.report.{vit.REPORT_COMMAND_SOURCE}"
+        self.assertFalse(vit.check_report_command_output("{"))
+        down = json.dumps({f"{prefix}.up": 0, f"{prefix}.metrics.value": 0})
+        self.assertFalse(vit.check_report_command_output(down))
+        good = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 0})
+        self.assertTrue(vit.check_report_command_output("{}\n" + good + "\n{"))
+        inherited = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 1})
+        with self.assertRaises(SystemExit):
+            vit.check_report_command_output(inherited)
+
+    def test_tracing_before_and_between_pretty_samples(self) -> None:
+        prefix = f"monitord.report.{vit.REPORT_COMMAND_SOURCE}"
+        down = json.dumps({f"{prefix}.up": 0, f"{prefix}.metrics.value": 0}, indent=2)
+        good = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 0}, indent=2)
+        log = (
+            'D1119 07:30:01.843293 5513 src/main.rs:63] '
+            'CLI Args: Cli { config: "test" }\n'
+        )
+        self.assertTrue(vit.check_report_command_output(log + down + "\n" + log + good + "\n{"))
+        self.assertFalse(vit.check_report_command_output(log + down + "\n" + log + good[:-1]))
+
+    def test_metrics_in_log_message_are_not_a_sample(self) -> None:
+        prefix = f"monitord.report.{vit.REPORT_COMMAND_SOURCE}"
+        good = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 0})
+        self.assertFalse(vit.check_report_command_output("I1119 debug sample: " + good + "\n"))
+        bad = json.dumps({f"{prefix}.up": 1, f"{prefix}.metrics.value": 3}, indent=2)
+        with self.assertRaises(SystemExit):
+            vit.check_report_command_output("I1119 starting collection\n" + bad)
+
+
+class ReportCommandIdentityTest(unittest.TestCase):
+    def test_config_enables_command_without_collecting_other_sockets(self) -> None:
+        conf = vit.build_capability_report_conf(
+            "[report]\nenabled = false\ncollect = false\n[report.sources.allowlist]\n"
+        )
+        self.assertIn("enabled = false", conf)
+        self.assertIn("collect = true", conf)
+        self.assertIn("com.example.none", section_body(conf, "[report.sources.allowlist]"))
+        self.assertIn(
+            f"{vit.COMMAND_IDENTITY_SOURCE} = {vit.COMMAND_IDENTITY_HELPER}",
+            section_body(conf, "[report.commands]"),
+        )
+
+    def sample(self) -> vit.Stats:
+        prefix = f"monitord.report.{vit.COMMAND_IDENTITY_SOURCE}"
+        return {
+            f"{prefix}.up": 1,
+            f"{prefix}.metrics.uid": 123,
+            f"{prefix}.metrics.CapPrm": "0000000000080000",
+            f"{prefix}.metrics.CapEff": "0000000000080000",
+            f"{prefix}.metrics.CapAmb": "0000000000080000",
+            f"{prefix}.metrics.NoNewPrivs": 1,
+        }
+
+    def test_expected_identity_passes(self) -> None:
+        vit.check_report_command_identity(self.sample(), 123, 1 << 19)
+
+    def test_missing_or_wrong_identity_fails(self) -> None:
+        for key in self.sample():
+            for replacement in (None, "wrong"):
+                with self.subTest(key=key, replacement=replacement):
+                    stats = self.sample()
+                    if replacement is None:
+                        del stats[key]
+                    else:
+                        stats[key] = replacement
+                    with self.assertRaises(SystemExit):
+                        vit.check_report_command_identity(stats, 123, 1 << 19)
 
 
 class MachineFailureIsolationTest(unittest.TestCase):
