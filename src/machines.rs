@@ -10,7 +10,7 @@ use tracing::{debug, error, warn};
 use zbus_systemd::machine1::{MachineProxy, ManagerProxy};
 
 use crate::varlink::endpoint::VarlinkEndpoint;
-use crate::varlink::machine::{ListOutput, Machine, MACHINE_SOCKET_PATH};
+use crate::varlink::machine::{ListOutput, Machine, MachineError, MACHINE_SOCKET_PATH};
 use crate::varlink::machine_connector::{self, MachineConnector, MachineSocket};
 use crate::MachineStats;
 use crate::MonitordStats;
@@ -133,11 +133,13 @@ async fn get_machines_varlink(
             futures_util::pin_mut!(stream);
             let mut listed = Vec::new();
             while let Some(reply) = stream.try_next().await? {
-                listed.push(
-                    reply.map_err(|e| anyhow::anyhow!("io.systemd.Machine.List error: {}", e))?,
-                );
+                match reply {
+                    Ok(machine) => listed.push(machine),
+                    Err(MachineError::NoSuchMachine) if listed.is_empty() => break,
+                    Err(err) => anyhow::bail!("io.systemd.Machine.List error: {err}"),
+                }
             }
-            anyhow::Ok(listed)
+            Ok::<_, anyhow::Error>(listed)
         })
     })
     .await??;
@@ -205,13 +207,21 @@ fn decide_cache_action(cached_pid: Option<u32>, leader_pid: u32) -> CacheAction 
     }
 }
 
-/// Remove cached connections for machines that no longer exist.
-async fn evict_stale_connections(
+/// Remove samples and connections for machines absent from the latest listing.
+async fn prune_departed_machines(
+    stats: &RwLock<MonitordStats>,
     cached_connections: &Mutex<MachineConnections>,
     current_machines: &HashMap<String, u32>,
 ) {
-    let mut cache = cached_connections.lock().await;
-    cache.retain(|name, _| current_machines.contains_key(name));
+    stats
+        .write()
+        .await
+        .machines
+        .retain(|name, _| current_machines.contains_key(name));
+    cached_connections
+        .lock()
+        .await
+        .retain(|name, _| current_machines.contains_key(name));
 }
 
 /// Evict a cached connection for a machine that experienced errors.
@@ -366,7 +376,12 @@ pub(crate) async fn update_machines_stats(
 ) -> anyhow::Result<()> {
     let current_machines = get_machines(&config, &dbus_cell, &host_stats).await?;
 
-    evict_stale_connections(&cached_connections, &current_machines).await;
+    prune_departed_machines(
+        &locked_monitord_stats,
+        &cached_connections,
+        &current_machines,
+    )
+    .await;
 
     for (machine, leader_pid) in current_machines.into_iter() {
         // A failed collector must not inherit the preceding machine's data.
@@ -382,6 +397,11 @@ pub(crate) async fn update_machines_stats(
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to connect to container {}: {:?}", machine, e);
+                locked_monitord_stats
+                    .write()
+                    .await
+                    .machines
+                    .remove(&machine);
                 continue;
             }
         };
@@ -631,13 +651,12 @@ pub(crate) async fn update_machines_stats(
             evict_failed_connection(&cached_connections, &machine).await;
         }
 
-        {
-            let mut monitord_stats = locked_monitord_stats.write().await;
-            let machine_stats = locked_machine_stats.read().await;
-            monitord_stats
-                .machines
-                .insert(machine, machine_stats.clone());
-        }
+        let machine_stats = std::mem::take(&mut *locked_machine_stats.write().await);
+        locked_monitord_stats
+            .write()
+            .await
+            .machines
+            .insert(machine, machine_stats);
     }
 
     Ok(())
@@ -688,6 +707,28 @@ mod tests {
 
     use super::{decide_cache_action, CacheAction};
 
+    #[tokio::test]
+    async fn test_prune_departed_machines() {
+        let stats = super::RwLock::new(crate::MonitordStats::default());
+        for name in ["running", "stopped"] {
+            stats
+                .write()
+                .await
+                .machines
+                .insert(name.into(), Default::default());
+        }
+        let connections = super::Mutex::default();
+        let mut listed = super::HashMap::from([("running".to_string(), 42)]);
+        super::prune_departed_machines(&stats, &connections, &listed).await;
+        assert_eq!(
+            stats.read().await.machines.keys().collect::<Vec<_>>(),
+            ["running"]
+        );
+        listed.clear();
+        super::prune_departed_machines(&stats, &connections, &listed).await;
+        assert!(stats.read().await.machines.is_empty());
+    }
+
     #[test]
     fn test_filter_machines() {
         let machines = ["foo", "bar", "baz"]
@@ -709,6 +750,34 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].0, "foo");
         assert_eq!(filtered[1].0, "baz");
+    }
+
+    #[tokio::test]
+    async fn test_empty_varlink_machine_list() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machined.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            BufReader::new(&mut socket)
+                .read_until(0, &mut Vec::new())
+                .await
+                .unwrap();
+            socket
+                .write_all(b"{\"error\":\"io.systemd.Machine.NoSuchMachine\"}\0")
+                .await
+                .unwrap();
+        });
+        let machines = super::get_machines_varlink(
+            path.to_str().unwrap().into(),
+            &crate::config::Config::default(),
+        )
+        .await
+        .unwrap();
+        assert!(machines.is_empty());
+        server.await.unwrap();
     }
 
     #[test]

@@ -498,6 +498,9 @@ From version `>=0.11` monitord supports obtaining the same set of key from
 systemd 'machines' (i.e. `machinectl --list`). Only machines of class `container`
 are collected. They are enumerated via machined's `io.systemd.Machine.List` varlink
 API (systemd v257+) when varlink is enabled, falling back to machined's D-Bus API.
+A successful listing removes departed containers from the current sample. If
+monitord cannot connect to a listed container, it omits that container for the
+sweep. If enumeration itself fails, the previous machine samples are retained.
 
 The keys are the same format as below in `json_flat` output but are prefixed with
 the `machines` keyword and machine name. For example:
