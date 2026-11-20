@@ -16,17 +16,21 @@
 //! sources already publish.
 
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::collections::VecDeque;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::stream;
+use futures_util::stream::{self, FuturesUnordered};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use zlink::connection::socket::{ReadHalf as ZlinkReadHalf, ReadResult, UnixSocket};
+use zlink::connection::Socket as ZlinkSocket;
 use zlink::introspect;
 
 use crate::{CollectorTiming, MonitordStats};
@@ -35,6 +39,13 @@ use crate::{CollectorTiming, MonitordStats};
 pub const REPORT_SOCKET_NAME: &str = "io.monitord";
 /// Directory `systemd-report` scans for system-scope sources.
 pub const REPORT_DIR: &str = "/run/systemd/report";
+/// Maximum number of clients the report server serves at once.
+const REPORT_CONNECTIONS_MAX: usize = 64;
+/// Leave capacity for report clients owned by other local users.
+const REPORT_CONNECTIONS_PER_UID_MAX: usize = 8;
+/// Maximum size of a request frame before its NUL terminator.
+const REPORT_REQUEST_MAX_BYTES: usize = 64 * 1024;
+
 /// First fd systemd passes in socket activation (`SD_LISTEN_FDS_START`).
 const SD_LISTEN_FDS_START: i32 = 3;
 
@@ -537,7 +548,7 @@ fn listener(
     spec: ReportListener,
     cleanup: &mut Option<SocketCleanup>,
     #[cfg(test)] set_cloexec_override: Option<fn(std::os::fd::RawFd) -> std::io::Result<()>>,
-) -> anyhow::Result<zlink::tokio::unix::Listener> {
+) -> anyhow::Result<ReportListeningSocket> {
     #[cfg(test)]
     let set_cloexec = set_cloexec_override.unwrap_or(set_cloexec);
     match spec {
@@ -545,7 +556,7 @@ fn listener(
             validate_listener(fd.as_raw_fd())?;
             set_cloexec(fd.as_raw_fd())?;
             info!("Serving {REPORT_SOCKET_NAME} metrics on a prebound fd");
-            Ok(zlink::tokio::unix::Listener::try_from(fd)?)
+            tokio_listener(zlink::tokio::unix::Listener::try_from(fd)?)
         }
         ReportListener::SelfBind(dir) => {
             anyhow::ensure!(dir.is_absolute(), "report directory must be absolute");
@@ -562,7 +573,212 @@ fn listener(
             // matching systemd's metric source sockets (SocketMode=0666).
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
             info!("Serving {REPORT_SOCKET_NAME} metrics on {}", path.display());
-            Ok(listener)
+            tokio_listener(listener)
+        }
+    }
+}
+
+/// Keep the original descriptor open while serving through a clone. Prebound
+/// descriptors retain their identity and zlink's listener tags stay in place.
+struct ReportListeningSocket {
+    accepts: tokio::net::UnixListener,
+    _tagged: zlink::tokio::unix::Listener,
+    #[cfg(test)]
+    fail_accept: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl ReportListeningSocket {
+    async fn accept(
+        &mut self,
+    ) -> std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)> {
+        #[cfg(test)]
+        if let Some(fail) = self.fail_accept.as_mut() {
+            tokio::select! {
+                accepted = self.accepts.accept() => return accepted,
+                _ = fail => {}
+            }
+            self.fail_accept = None;
+            return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        self.accepts.accept().await
+    }
+}
+
+fn tokio_listener(listener: zlink::tokio::unix::Listener) -> anyhow::Result<ReportListeningSocket> {
+    let fd = listener.as_fd().try_clone_to_owned()?;
+    let std_listener = std::os::unix::net::UnixListener::from(fd);
+    std_listener.set_nonblocking(true)?;
+    Ok(ReportListeningSocket {
+        accepts: tokio::net::UnixListener::from_std(std_listener)?,
+        _tagged: listener,
+        #[cfg(test)]
+        fail_accept: None,
+    })
+}
+
+/// No report method accepts file descriptors. Keep each request frame small
+/// and hand zlink only one complete frame at a time.
+#[derive(Debug)]
+struct ReportSocket(zlink::tokio::unix::Stream);
+
+impl ZlinkSocket for ReportSocket {
+    type ReadHalf = ReportReadHalf;
+    type WriteHalf = <zlink::tokio::unix::Stream as ZlinkSocket>::WriteHalf;
+
+    fn split(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        let (read, write) = ZlinkSocket::split(self.0);
+        (
+            ReportReadHalf {
+                inner: read,
+                queued: VecDeque::new(),
+                frame_bytes: 0,
+            },
+            write,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ReportReadHalf {
+    inner: <zlink::tokio::unix::Stream as ZlinkSocket>::ReadHalf,
+    queued: VecDeque<u8>,
+    frame_bytes: usize,
+}
+
+impl ReportReadHalf {
+    fn check_frame(&mut self, bytes: &[u8]) -> zlink::Result<()> {
+        for byte in bytes {
+            if *byte == 0 {
+                self.frame_bytes = 0;
+            } else {
+                self.frame_bytes += 1;
+                if self.frame_bytes > REPORT_REQUEST_MAX_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "report request exceeds 64 KiB",
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AsFd for ReportReadHalf {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+impl UnixSocket for ReportReadHalf {}
+
+impl ZlinkReadHalf for ReportReadHalf {
+    async fn read(&mut self, buf: &mut [u8]) -> zlink::Result<ReadResult> {
+        if !self.queued.is_empty() {
+            let mut count = 0;
+            while count < buf.len() {
+                let Some(byte) = self.queued.pop_front() else {
+                    break;
+                };
+                buf[count] = byte;
+                count += 1;
+                if byte == 0 {
+                    break;
+                }
+            }
+            self.check_frame(&buf[..count])?;
+            return Ok(ReadResult::new(count));
+        }
+
+        let mut result = ZlinkReadHalf::read(&mut self.inner, buf).await?;
+        if !result.fds().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "report clients may not pass file descriptors",
+            )
+            .into());
+        }
+        let size = result.bytes_read();
+        let end = buf[..size]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map_or(size, |index| index + 1);
+        self.queued.extend(&buf[end..size]);
+        self.check_frame(&buf[..end])?;
+        #[cfg(target_os = "linux")]
+        let credentials = result.take_credentials();
+        let next = ReadResult::new(end);
+        #[cfg(target_os = "linux")]
+        let next = next.set_credentials(credentials);
+        Ok(next)
+    }
+}
+
+async fn serve(
+    mut listener: ReportListeningSocket,
+    stats: Arc<RwLock<MonitordStats>>,
+    max_connections: usize,
+    per_uid_limit: usize,
+    #[cfg(test)] fail_accept: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)] mut accept_error_handled: Option<tokio::sync::oneshot::Sender<()>>,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    {
+        listener.fail_accept = fail_accept;
+    }
+    let mut clients = FuturesUnordered::new();
+    let mut clients_by_uid = BTreeMap::<u32, usize>::new();
+    loop {
+        tokio::select! {
+            biased;
+            Some((uid, result)) = clients.next(), if !clients.is_empty() => {
+                let count = clients_by_uid.get_mut(&uid).expect("admitted uid must be counted");
+                *count -= 1;
+                if *count == 0 {
+                    clients_by_uid.remove(&uid);
+                }
+                result?;
+            }
+            accepted = listener.accept(), if clients.len() < max_connections => {
+                let (stream, _) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error)
+                        if !clients.is_empty()
+                            && matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+                    {
+                        warn!("Report socket reached its file descriptor limit; closing {} clients", clients.len());
+                        clients = FuturesUnordered::new();
+                        clients_by_uid.clear();
+                        #[cfg(test)]
+                        if let Some(handled) = accept_error_handled.take() {
+                            let _ = handled.send(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let uid = match stream.peer_cred() {
+                    Ok(credentials) => credentials.uid(),
+                    Err(error) => {
+                        debug!("Unable to get report client credentials: {error}");
+                        continue;
+                    }
+                };
+                if clients_by_uid.get(&uid).copied().unwrap_or(0) >= per_uid_limit {
+                    debug!("Too many report clients from uid {uid}; closing new connection");
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                zlink::unix_utils::tag_socket(&stream, zlink::unix_utils::SocketRole::Server);
+                let socket = ReportSocket(stream.try_into()?);
+                let service = MetricsService::new(stats.clone());
+                *clients_by_uid.entry(uid).or_default() += 1;
+                clients.push(async move {
+                    (uid, zlink::Server::new(zlink::ReadyListener::new(socket), service).run().await)
+                });
+            }
         }
     }
 }
@@ -578,6 +794,10 @@ struct ServerHooks {
     panic_after_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     failure: Option<tokio::sync::oneshot::Receiver<()>>,
     cleaned: Option<tokio::sync::oneshot::Sender<()>>,
+    connection_limit: Option<usize>,
+    per_uid_limit: Option<usize>,
+    accept_error: Option<tokio::sync::oneshot::Receiver<()>>,
+    accept_error_handled: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Own a report server running on a dedicated current-thread Tokio runtime.
@@ -587,6 +807,10 @@ struct ServerHooks {
 /// orderly stop. Dropping the handle requests a stop without waiting.
 ///
 /// The dedicated runtime accommodates zlink's non-Send server future.
+/// At most 64 clients, and eight per user, are served concurrently. Requests
+/// over 64 KiB and passed file descriptors are rejected. File descriptor
+/// exhaustion with active clients closes them and retries; other serve errors
+/// reach wait.
 /// Cleanup checks the bound path's device and inode before removing it. Only
 /// one server should bind each path: checking identity and unlinking are
 /// separate operations. SIGKILL and process crashes leave a stale socket,
@@ -659,13 +883,18 @@ impl ReportServer {
                         if let Some(sent) = hooks.ready_sent.take() {
                             let _ = sent.send(());
                         }
-                        let service = MetricsService::new(stats);
-                        let server = zlink::Server::new(listener, service);
                         let serving = async {
                             #[cfg(test)]
                             {
                                 tokio::select! {
-                                    result = server.run() => result.map_err(anyhow::Error::from),
+                                    result = serve(
+                                        listener,
+                                        stats,
+                                        hooks.connection_limit.unwrap_or(REPORT_CONNECTIONS_MAX),
+                                        hooks.per_uid_limit.unwrap_or(REPORT_CONNECTIONS_PER_UID_MAX),
+                                        hooks.accept_error.take(),
+                                        hooks.accept_error_handled.take(),
+                                    ) => result,
                                     _ = async {
                                         if let Some(failure) = hooks.failure.take() {
                                             let _ = failure.await;
@@ -684,7 +913,12 @@ impl ReportServer {
                             }
                             #[cfg(not(test))]
                             {
-                                server.run().await.map_err(anyhow::Error::from)
+                                serve(
+                                    listener,
+                                    stats,
+                                    REPORT_CONNECTIONS_MAX,
+                                    REPORT_CONNECTIONS_PER_UID_MAX,
+                                ).await
                             }
                         };
                         tokio::select! {
@@ -769,6 +1003,8 @@ mod tests {
     use super::*;
     use crate::varlink::metrics::{Metrics, MetricsError};
     use futures_util::StreamExt;
+    use std::io::{Read, Write};
+    use zlink::tokio::unix::Connection;
 
     /// Port of systemd's `varlink_idl_interface_name_is_valid`: dot
     /// separated labels of ASCII letters, digits and `-`, each starting
@@ -1038,6 +1274,156 @@ mod tests {
         deadline(round_trip_client(&socket)).await;
         deadline(server.shutdown()).await.unwrap();
         assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn test_report_connection_limit_keeps_server_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(REPORT_SOCKET_NAME);
+        let hooks = ServerHooks {
+            connection_limit: Some(2),
+            ..Default::default()
+        };
+        let mut server = start_test_server(dir.path(), hooks).await;
+
+        let (first, _second) = connect_two_clients(&socket).await;
+
+        // Both served clients remain connected. A third may connect into the
+        // kernel backlog, but it cannot receive a report until one leaves.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            round_trip_client(&socket)
+        )
+        .await
+        .is_err());
+        assert_wait_pending(&mut server).await;
+
+        drop(first);
+        deadline(round_trip_client(&socket)).await;
+        deadline(server.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_report_per_uid_connection_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(REPORT_SOCKET_NAME);
+        let hooks = ServerHooks {
+            connection_limit: Some(4),
+            per_uid_limit: Some(2),
+            ..Default::default()
+        };
+        let mut server = start_test_server(dir.path(), hooks).await;
+
+        let (first, _second) = connect_two_clients(&socket).await;
+
+        let mut extra = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        assert_report_client_closed(&mut extra);
+        drop(extra);
+        drop(first);
+        deadline(round_trip_client(&socket)).await;
+        assert_wait_pending(&mut server).await;
+        deadline(server.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_report_fd_limit_releases_clients_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(REPORT_SOCKET_NAME);
+        let (exhausted, fail_accept) = tokio::sync::oneshot::channel();
+        let (accept_error_handled, handled) = tokio::sync::oneshot::channel();
+        let hooks = ServerHooks {
+            connection_limit: Some(2),
+            per_uid_limit: Some(1),
+            accept_error: Some(fail_accept),
+            accept_error_handled: Some(accept_error_handled),
+            ..Default::default()
+        };
+        let mut server = start_test_server(dir.path(), hooks).await;
+
+        let mut held = deadline(zlink::tokio::unix::connect(&socket))
+            .await
+            .unwrap();
+        assert_client_admitted(&mut held).await;
+
+        // The injected accept error stands in for a low RLIMIT_NOFILE. The
+        // per-user limit proves the old client was freed before a new request.
+        exhausted.send(()).unwrap();
+        deadline(handled).await.unwrap();
+        deadline(round_trip_client(&socket)).await;
+        assert_wait_pending(&mut server).await;
+        deadline(server.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_report_rejects_passed_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(REPORT_SOCKET_NAME);
+        let hooks = ServerHooks {
+            connection_limit: Some(1),
+            ..Default::default()
+        };
+        let mut server = start_test_server(dir.path(), hooks).await;
+
+        let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        zlink::unix_utils::sendmsg(&client, b" ", &[file.as_fd()], None).unwrap();
+        assert_report_client_closed(&mut client);
+        drop(client);
+
+        deadline(round_trip_client(&socket)).await;
+        assert_wait_pending(&mut server).await;
+        deadline(server.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_report_rejects_oversized_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(REPORT_SOCKET_NAME);
+        let server = deadline(ReportServer::start(
+            ReportListener::SelfBind(dir.path().into()),
+            healthy_stats(),
+        ))
+        .await
+        .unwrap();
+
+        let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        client
+            .write_all(&vec![b' '; REPORT_REQUEST_MAX_BYTES + 1])
+            .unwrap();
+        assert_report_client_closed(&mut client);
+        drop(client);
+
+        deadline(round_trip_client(&socket)).await;
+        deadline(server.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_report_read_half_keeps_pipelined_frames() {
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        sender.write_all(b"a\0b\0").unwrap();
+        let stream = zlink::tokio::unix::Stream::try_from(receiver).unwrap();
+        let (mut read, _write) = ZlinkSocket::split(ReportSocket(stream));
+        let mut buf = [0; 16];
+        let first = deadline(ZlinkReadHalf::read(&mut read, &mut buf))
+            .await
+            .unwrap();
+        assert_eq!(&buf[..first.bytes_read()], b"a\0");
+        let second = deadline(ZlinkReadHalf::read(&mut read, &mut buf))
+            .await
+            .unwrap();
+        assert_eq!(&buf[..second.bytes_read()], b"b\0");
+    }
+
+    fn assert_report_client_closed(client: &mut std::os::unix::net::UnixStream) {
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0];
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("report client was not closed: {other:?}"),
+        }
     }
 
     fn healthy_stats() -> Arc<RwLock<MonitordStats>> {
@@ -1374,6 +1760,20 @@ mod tests {
         ))
         .await
         .unwrap()
+    }
+
+    async fn connect_two_clients(socket: &Path) -> (Connection, Connection) {
+        let mut first = deadline(zlink::tokio::unix::connect(socket)).await.unwrap();
+        let mut second = deadline(zlink::tokio::unix::connect(socket)).await.unwrap();
+        for client in [&mut first, &mut second] {
+            assert_client_admitted(client).await;
+        }
+        (first, second)
+    }
+
+    async fn assert_client_admitted(client: &mut Connection) {
+        let mut replies = deadline(client.list()).await.unwrap();
+        assert!(deadline(replies.next()).await.is_some());
     }
 
     async fn assert_wait_pending(server: &mut ReportServer) {

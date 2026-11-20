@@ -420,6 +420,13 @@ SIGTERM and SIGINT stop collection and await report cleanup for up to five
 seconds; timeout exits nonzero, and a normal stop exits zero. The main runtime
 then gets up to two seconds to release blocking collector tasks. A one-shot
 binary with reporting enabled and no activation fd warns and collects once.
+The report server serves at most 64 concurrent clients and eight per user.
+Clients over the total limit can queue in the socket's bounded backlog;
+clients over the per-user limit are closed. Reaching either limit does not
+stop collection. Requests over 64 KiB and requests that pass file descriptors
+are rejected; the metrics methods need neither. If an accept runs out of file
+descriptors while report clients are connected, the server closes those clients
+and retries.
 
 Library users call `unsafe { report::take_activation_fd() }` in `main` before
 starting any other threads, with no other owner of fd 3. In async code, create
