@@ -186,12 +186,19 @@ pub fn is_permission_denied(err: &anyhow::Error) -> bool {
 mod sys {
     use std::fs::File;
     use std::io;
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    use rustix::io::retry_on_intr;
+    use rustix::net::{
+        self, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+        SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
+    };
 
     use super::{MachineConnector, MachineConnectorError, MachineSocket, HELPER_ARG};
 
@@ -259,19 +266,7 @@ mod sys {
     }
 
     pub(super) fn request(control: &OwnedFd, socket: MachineSocket) -> io::Result<UnixStream> {
-        let byte = [socket as u8];
-        // SAFETY: valid fd and a 1 byte buffer that outlives the call.
-        let sent = unsafe {
-            libc::send(
-                control.as_raw_fd(),
-                byte.as_ptr().cast(),
-                byte.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        net::send(control, &[socket as u8], SendFlags::NOSIGNAL)?;
         match recv_status(control.as_fd())? {
             (0, Some(fd)) => Ok(UnixStream::from(fd)),
             (0, None) => Err(io::Error::other("connector replied without a socket")),
@@ -305,18 +300,10 @@ mod sys {
     pub(super) fn serve(control: BorrowedFd<'_>, root: BorrowedFd<'_>) -> io::Result<()> {
         loop {
             let mut byte = [0u8; 1];
-            // SAFETY: valid fd and a 1 byte buffer that outlives the call.
-            let n = unsafe { libc::recv(control.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) };
-            match n {
-                0 => return Ok(()),
-                n if n < 0 => {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                _ => {}
+            let (_, received) =
+                retry_on_intr(|| net::recv(control, &mut byte, RecvFlags::empty()))?;
+            if received == 0 {
+                return Ok(());
             }
             let Some(socket) = MachineSocket::from_byte(byte[0]) else {
                 send_status(control, libc::EINVAL as u8, None)?;
@@ -416,18 +403,12 @@ mod sys {
     }
 
     pub(super) fn seqpacket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: fds has room for the two descriptors socketpair returns.
-        check(unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-                fds.as_mut_ptr(),
-            )
-        })?;
-        // SAFETY: socketpair succeeded, so both are fresh fds we now own.
-        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+        Ok(net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )?)
     }
 
     fn set_recv_timeout(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<()> {
@@ -447,99 +428,60 @@ mod sys {
         })
     }
 
-    /// Room for one fd worth of `SCM_RIGHTS`, suitably aligned.
-    #[repr(C, align(8))]
-    struct CmsgBuf([u8; 64]);
-
     /// Send a status byte, optionally with one fd attached.
     pub(super) fn send_status(
         sock: BorrowedFd<'_>,
         status: u8,
         fd: Option<BorrowedFd<'_>>,
     ) -> io::Result<()> {
-        let mut data = [status];
-        let mut iov = libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: data.len(),
-        };
-        let mut cmsg_buf = CmsgBuf([0; 64]);
-        // SAFETY: an all-zero msghdr is a valid empty message.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        if let Some(fd) = fd {
-            // SAFETY: CMSG_* on a buffer sized and aligned for one fd.
-            unsafe {
-                let space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
-                debug_assert!(space <= cmsg_buf.0.len());
-                msg.msg_control = cmsg_buf.0.as_mut_ptr().cast();
-                msg.msg_controllen = space as _;
-                let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd.as_raw_fd());
-            }
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        if fd.is_some() {
+            assert!(control.push(SendAncillaryMessage::ScmRights(fd.as_slice())));
         }
-        loop {
-            // SAFETY: msg points at buffers that live until the call returns.
-            if unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) } >= 0 {
-                return Ok(());
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
+        retry_on_intr(|| {
+            net::sendmsg(
+                sock,
+                &[io::IoSlice::new(&[status])],
+                &mut control,
+                SendFlags::NOSIGNAL,
+            )
+        })?;
+        Ok(())
     }
 
     /// Receive a status byte and the fd attached to it, if any.
     pub(super) fn recv_status(sock: BorrowedFd<'_>) -> io::Result<(u8, Option<OwnedFd>)> {
-        let mut data = [0u8; 1];
-        let mut iov = libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: data.len(),
-        };
-        let mut cmsg_buf = CmsgBuf([0; 64]);
-        // SAFETY: an all-zero msghdr is a valid empty message.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.0.as_mut_ptr().cast();
-        msg.msg_controllen = cmsg_buf.0.len() as _;
-        let n = loop {
-            // SAFETY: msg points at buffers that live until the call returns.
-            let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-            if n >= 0 {
-                break n;
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        };
-        if n == 0 {
+        // Keep the full 64 bytes available after rustix aligns the control buffer.
+        #[repr(C, align(8))]
+        struct ControlSpace([MaybeUninit<u8>; 64]);
+        let mut space = ControlSpace([MaybeUninit::uninit(); 64]);
+        let mut control = RecvAncillaryBuffer::new(&mut space.0);
+        let mut status = [0];
+        let message = retry_on_intr(|| {
+            net::recvmsg(
+                sock,
+                &mut [io::IoSliceMut::new(&mut status)],
+                &mut control,
+                RecvFlags::CMSG_CLOEXEC,
+            )
+        })?;
+        if message.bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "machine connector exited",
             ));
         }
-        let mut received = None;
-        // SAFETY: walking the control messages recvmsg filled in.
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                    let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
-                    received = Some(OwnedFd::from_raw_fd(fd));
-                }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-        }
-        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        if message.flags.contains(ReturnFlags::CTRUNC) {
             return Err(io::Error::other("truncated control message from connector"));
         }
-        Ok((data[0], received))
+        let mut received = None;
+        for message in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(mut fds) = message {
+                received = fds.next();
+            }
+        }
+        Ok((status[0], received))
     }
 }
 
@@ -617,6 +559,9 @@ mod tests {
         assert_eq!(status, 0);
         // The passed fd is the same socket: writing to it reaches y.
         let mut passed = std::os::unix::net::UnixStream::from(fd.unwrap());
+        assert!(rustix::io::fcntl_getfd(&passed)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC));
         passed.write_all(b"hi").unwrap();
         let mut buf = [0u8; 2];
         y.read_exact(&mut buf).unwrap();
@@ -629,6 +574,46 @@ mod tests {
         drop(a);
         let err = recv_status(b.as_fd()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_status_closes_extra_fds_at_control_buffer_limit() {
+        use crate::tests::socket_fd_count;
+        use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use std::mem::{size_of, MaybeUninit};
+        use std::os::fd::RawFd;
+
+        const FIT: usize = (64 - size_of::<libc::cmsghdr>()) / size_of::<RawFd>();
+        let (sender, receiver) = seqpacket_pair().unwrap();
+        let (first, extra) = std::os::unix::net::UnixStream::pair().unwrap();
+        for count in [FIT, FIT + 1] {
+            let mut fds = [extra.as_fd(); FIT + 1];
+            fds[0] = first.as_fd();
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(FIT + 1))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            assert!(control.push(SendAncillaryMessage::ScmRights(&fds[..count])));
+            sendmsg(
+                &sender,
+                &[io::IoSlice::new(&[0])],
+                &mut control,
+                SendFlags::NOSIGNAL,
+            )
+            .unwrap();
+
+            let result = recv_status(receiver.as_fd());
+            if count == FIT {
+                assert!(matches!(&result, Ok((0, Some(_)))));
+                assert_eq!(socket_fd_count(&first), 2);
+            } else {
+                assert_eq!(
+                    result.as_ref().unwrap_err().to_string(),
+                    "truncated control message from connector"
+                );
+                assert_eq!(socket_fd_count(&first), 1);
+            }
+            // Concurrent children can inherit the sockets until exec.
+            assert_eq!(socket_fd_count(&extra), 1);
+        }
     }
 
     /// The helper's request loop, against a temp dir standing in for a
@@ -655,17 +640,8 @@ mod tests {
         let err = sys::request(&control, MachineSocket::Network).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
 
-        // SAFETY: plain send on a valid fd with a 1 byte buffer.
-        let bogus = [99u8];
         assert_eq!(
-            unsafe {
-                libc::send(
-                    std::os::fd::AsRawFd::as_raw_fd(&control),
-                    bogus.as_ptr().cast(),
-                    1,
-                    0,
-                )
-            },
+            rustix::net::send(&control, &[99], rustix::net::SendFlags::empty()).unwrap(),
             1
         );
         assert_eq!(recv_status(control.as_fd()).unwrap().0, libc::EINVAL as u8);

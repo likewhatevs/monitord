@@ -889,6 +889,25 @@ pub async fn stat_collector(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn socket_fd_count(socket: &impl std::os::fd::AsRawFd) -> usize {
+        let fds = std::path::Path::new("/proc/self/fd");
+        let target = fds
+            .join(socket.as_raw_fd().to_string())
+            .read_link()
+            .unwrap();
+        std::fs::read_dir(fds)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|fd| match fd.read_link() {
+                Ok(link) => link == target,
+                // An unrelated descriptor can close during the scan.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => panic!("reading {}: {e}", fd.display()),
+            })
+            .count()
+    }
+
     #[tokio::test]
     async fn test_report_counters_persist_across_one_shot_calls() {
         let dir = tempfile::tempdir().unwrap();

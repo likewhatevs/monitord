@@ -1492,21 +1492,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(REPORT_SOCKET_NAME);
         let owner = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        #[cfg(target_os = "linux")]
-        let listener_fd_count = || {
-            let fds = Path::new("/proc/self/fd");
-            let target = fds.join(owner.as_raw_fd().to_string()).read_link().unwrap();
-            std::fs::read_dir(fds)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|fd| match fd.read_link() {
-                    Ok(link) => link == target,
-                    // An unrelated descriptor can close during the scan.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(e) => panic!("reading {}: {e}", fd.display()),
-                })
-                .count()
-        };
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let fd: OwnedFd = owner.try_clone().unwrap().into();
         let raw_fd = fd.as_raw_fd();
@@ -1519,7 +1504,11 @@ mod tests {
         .await
         .unwrap();
         #[cfg(target_os = "linux")]
-        assert_eq!(listener_fd_count(), 2, "one fd each for owner and server");
+        assert_eq!(
+            crate::tests::socket_fd_count(&owner),
+            2,
+            "one fd each for owner and server"
+        );
         let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
         assert!(flags >= 0);
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
@@ -1530,7 +1519,7 @@ mod tests {
         deadline(round_trip_client(&socket)).await;
         deadline(server.shutdown()).await.unwrap();
         #[cfg(target_os = "linux")]
-        assert_eq!(listener_fd_count(), 1);
+        assert_eq!(crate::tests::socket_fd_count(&owner), 1);
         assert!(socket.exists());
         // A surviving pathname alone would miss shutdown(2) on the shared
         // open file. Prove the original owner's listener can accept again.
