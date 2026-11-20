@@ -37,7 +37,7 @@ pub struct Pid1Stats {
     pub memory_usage_bytes: u64,
     /// Number of open file descriptors held by PID 1 (from /proc/1/fd/)
     pub fd_count: u64,
-    /// Number of threads/tasks belonging to PID 1 (from /proc/1/task/)
+    /// Number of threads belonging to PID 1 (from /proc/1/stat num_threads)
     pub tasks: u64,
 }
 
@@ -56,13 +56,7 @@ pub fn get_pid_stats(pid: i32) -> Result<Pid1Stats, MonitordPid1Error> {
         cpu_time_user: (stat_file.utime) / (ticks_per_second),
         memory_usage_bytes: (stat_file.rss) * (bytes_per_page),
         fd_count: pid1_proc.fd_count()?.try_into()?,
-        // Using 0 as impossible number of tasks
-        tasks: pid1_proc
-            .tasks()?
-            .flatten()
-            .collect::<Vec<_>>()
-            .len()
-            .try_into()?,
+        tasks: stat_file.num_threads.try_into()?,
     })
 }
 
