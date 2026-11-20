@@ -40,7 +40,7 @@ pub const HELPER_ARG: &str = "__monitord-machine-connector";
 ///
 /// A fixed allowlist sent as a single byte, rather than arbitrary paths, so a
 /// helper can only ever be used to reach these read-mostly systemd endpoints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
 #[repr(u8)]
 pub enum MachineSocket {
     /// PID 1's `io.systemd.Manager`, `io.systemd.Unit` and `io.systemd.Job`.
@@ -61,10 +61,6 @@ impl MachineSocket {
             Self::Metrics => crate::varlink_units::METRICS_SOCKET_PATH,
             Self::Network => crate::varlink::network::NETWORK_SOCKET_PATH,
         }
-    }
-
-    fn from_byte(byte: u8) -> Option<Self> {
-        Self::ALL.into_iter().find(|socket| *socket as u8 == byte)
     }
 }
 
@@ -306,7 +302,7 @@ mod sys {
             if received == 0 {
                 return Ok(());
             }
-            let Some(socket) = MachineSocket::from_byte(byte[0]) else {
+            let Ok(socket) = MachineSocket::try_from(byte[0]) else {
                 send_status(control, libc::EINVAL as u8, None)?;
                 continue;
             };
@@ -497,10 +493,10 @@ mod tests {
     #[test]
     fn test_machine_socket_byte_roundtrip() {
         for socket in MachineSocket::ALL {
-            assert_eq!(MachineSocket::from_byte(socket as u8), Some(socket));
+            assert_eq!(MachineSocket::try_from(socket as u8).unwrap(), socket);
         }
-        assert_eq!(MachineSocket::from_byte(0), None);
-        assert_eq!(MachineSocket::from_byte(42), None);
+        assert!(MachineSocket::try_from(0u8).is_err());
+        assert!(MachineSocket::try_from(42u8).is_err());
     }
 
     #[test]
